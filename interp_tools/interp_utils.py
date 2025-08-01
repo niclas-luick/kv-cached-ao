@@ -199,22 +199,9 @@ def get_interp_prompts(
     1) Loads or builds a tokenized dataset (B, context_length).
     2) Splits into batches of size batch_size.
     3) Runs get_max_activating_prompts(...) to get top-k tokens/activations.
-
-    :param model: A loaded AutoModelForCausalLM (already on device).
-    :param submodule: The submodule (e.g. layer) on which to hook activations.
-    :param sae: Your dictionary-learning topk model (sae).
-    :param dim_indices: A LongTensor of dimension indices of interest [F].
-    :param context_length: The sequence length used in the model.
-    :param tokenizer: The tokenizer corresponding to your model.
-    :param dataset_name: Name for the HF dataset from which to load text.
-    :param num_tokens: How many tokens total we want (roughly).
-    :param batch_size: Batch size for forward passes.
-    :param tokens_folder: Where to cache the tokenized dataset.
-    :param force_rebuild_tokens: If True, ignore any existing token cache and rebuild.
-    :return: (max_tokens_FKL, max_activations_FKL)
     """
     device = model.device
-    model_name = getattr(model.config, "_name_or_path", "unknown_model")
+    model_name = model.config._name_or_path
 
     batched_tokens = data_utils.get_batched_tokens(
         tokenizer=tokenizer,
@@ -231,6 +218,7 @@ def get_interp_prompts(
     # Now get the max-activating prompts for the given dim_indices
     max_tokens_FKL, max_activations_FKL = get_max_activating_prompts(
         model=model,
+        tokenizer=tokenizer,
         submodule=submodule,
         tokenized_inputs_bL=batched_tokens,
         dim_indices=dim_indices,

@@ -1,94 +1,98 @@
 import torch
 import einops
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 import os
-import random
-import pickle
 import itertools
 
-import mypkg.whitebox_infra.attribution as attribution
-import mypkg.whitebox_infra.dictionaries.batch_topk_sae as batch_topk_sae
-import mypkg.whitebox_infra.data_utils as data_utils
-import mypkg.whitebox_infra.model_utils as model_utils
-import mypkg.whitebox_infra.interp_utils as interp_utils
-import mypkg.pipeline.setup.dataset as dataset_setup
-import mypkg.pipeline.infra.hiring_bias_prompts as hiring_bias_prompts
-from mypkg.eval_config import EvalConfig
+import interp_tools.model_utils as model_utils
+import interp_tools.interp_utils as interp_utils
+import interp_tools.saes.jumprelu_sae as jumprelu_sae
 
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+@dataclass
+class MaxActsConfig:
+    """Configuration settings for the script."""
+
+    # --- Foundational Settings ---
+    model_name: str = "google/gemma-2-9b-it"
+
+    # --- SAE (Sparse Autoencoder) Settings ---
+    sae_repo_id: str = "google/gemma-scope-9b-it-res"
+    sae_layer: int = 9
+    sae_width: int = 16  # For loading the correct max acts file
+    sae_filename: str = f"layer_{sae_layer}/width_{sae_width}k/average_l0_88/params.npz"
+    layer_percent: int = 25  # For loading the correct max acts file
+
+    # --- Experiment Settings ---
+    context_length: int = 32
+    num_tokens: int = 3_000_000
+    batch_size: int = 128
+
+
+def load_sae_and_model(
+    cfg: MaxActsConfig, device: torch.device, dtype: torch.dtype
+) -> tuple[AutoModelForCausalLM, AutoTokenizer, jumprelu_sae.JumpReluSAE]:
+    """Loads the model, tokenizer, and SAE from Hugging Face."""
+    print(f"Loading model: {cfg.model_name}...")
+    model = AutoModelForCausalLM.from_pretrained(
+        cfg.model_name, device_map="auto", torch_dtype=dtype
+    )
+    tokenizer = AutoTokenizer.from_pretrained(cfg.model_name)
+
+    print(f"Loading SAE for layer {cfg.sae_layer} from {cfg.sae_repo_id}...")
+    sae = jumprelu_sae.load_gemma_scope_jumprelu_sae(
+        repo_id=cfg.sae_repo_id,
+        filename=cfg.sae_filename,
+        layer=cfg.sae_layer,
+        model_name=cfg.model_name,
+        device=device,
+        dtype=dtype,
+    )
+
+    print("Model, tokenizer, and SAE loaded successfully.")
+    return model, tokenizer, sae
+
+
+cfg = MaxActsConfig()
+device = torch.device("cuda")
 dtype = torch.bfloat16
 
-model_names = [
-    "mistralai/Ministral-8B-Instruct-2410",
-    "mistralai/Mistral-Small-24B-Instruct-2501",
-    "google/gemma-2-9b-it",
-    "google/gemma-2-27b-it",
-]
+model, tokenizer, sae = load_sae_and_model(cfg, device, dtype)
 
-for model_name in model_names:
-    if "mistral" in model_name:
-        trainer_ids = [0, 1, 2, 3]
-    else:
-        trainer_ids = [131]
 
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name, torch_dtype=dtype, device_map=device
+gradient_checkpointing = False
+if gradient_checkpointing:
+    model.config.use_cache = False
+    model.gradient_checkpointing_enable()
+
+
+acts_folder = "max_acts"
+os.makedirs(acts_folder, exist_ok=True)
+
+submodules = [model_utils.get_submodule(model, cfg.sae_layer)]
+
+acts_filename = os.path.join(
+    acts_folder,
+    f"acts_{cfg.model_name}_layer_{cfg.sae_layer}_trainer_{cfg.sae_width}_layer_percent_{cfg.layer_percent}_context_length_{cfg.context_length}.pt".replace(
+        "/", "_"
+    ),
+)
+
+if not os.path.exists(acts_filename):
+    max_tokens, max_acts = interp_utils.get_interp_prompts(
+        model,
+        submodules[0],
+        sae,
+        torch.tensor(list(range(sae.W_dec.shape[0]))),
+        context_length=cfg.context_length,
+        tokenizer=tokenizer,
+        batch_size=cfg.batch_size,
+        num_tokens=cfg.num_tokens,
     )
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-
-    gradient_checkpointing = False
-
-    if model_name == "google/gemma-2-27b-it":
-        gradient_checkpointing = True
-        batch_size = 1
-    elif model_name == "mistralai/Mistral-Small-24B-Instruct-2501":
-        batch_size = 2
-    else:
-        batch_size = 4
-
-    if gradient_checkpointing:
-        model.config.use_cache = False
-        model.gradient_checkpointing_enable()
-
-    chosen_layer_percentages = [25, 50, 75]
-
-    acts_folder = "max_acts"
-    os.makedirs(acts_folder, exist_ok=True)
-
-    for trainer_id, chosen_layer_percentage in itertools.product(
-        trainer_ids, chosen_layer_percentages
-    ):
-        chosen_layer = model_utils.MODEL_CONFIGS[model_name]["layer_mappings"][
-            chosen_layer_percentage
-        ]["layer"]
-
-        sae = model_utils.load_model_sae(
-            model_name, device, dtype, chosen_layer_percentage, trainer_id=trainer_id
-        )
-
-        submodules = [model_utils.get_submodule(model, chosen_layer)]
-
-        acts_filename = os.path.join(
-            acts_folder,
-            f"acts_{model_name}_layer_{chosen_layer}_trainer_{trainer_id}_layer_percent_{chosen_layer_percentage}.pt".replace(
-                "/", "_"
-            ),
-        )
-
-        if not os.path.exists(acts_filename):
-            max_tokens, max_acts = interp_utils.get_interp_prompts(
-                model,
-                submodules[0],
-                sae,
-                torch.tensor(list(range(sae.W_dec.shape[0]))),
-                context_length=128,
-                tokenizer=tokenizer,
-                batch_size=batch_size * 8,
-                num_tokens=30_000_000,
-            )
-            acts_data = {
-                "max_tokens": max_tokens,
-                "max_acts": max_acts,
-            }
-            torch.save(acts_data, acts_filename)
+    acts_data = {
+        "max_tokens": max_tokens,
+        "max_acts": max_acts,
+        "cfg": asdict(cfg),
+    }
+    torch.save(acts_data, acts_filename)

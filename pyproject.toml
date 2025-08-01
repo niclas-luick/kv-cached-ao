@@ -17,7 +17,7 @@ dependencies = [
     "circuitsvis>=1.43.3",
     "jaxtyping",
     "accelerate",
-    "datasets",
+    "datasets==3.6.0", # breaking change in 4.0.0 for trust remote code
     "huggingface-hub",
     "matplotlib",
     "torch==2.7.0",
