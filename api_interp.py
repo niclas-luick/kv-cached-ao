@@ -506,6 +506,8 @@ async def main(cfg: Config):
         batch_size=32,
     )
 
+    cfg.results_filename = "contrastive_rewriting_results_131k.pkl"
+
     # 5. Save Results
     print(f"\nSaving all results to {cfg.results_filename}...")
     with open(cfg.results_filename, "wb") as f:
