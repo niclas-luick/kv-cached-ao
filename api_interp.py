@@ -235,7 +235,7 @@ def parallel_eval(
             # [1:] to skip bos token
             original_sentence = "".join(
                 list_decode(feature_tokens[sent_idx][1:], tokenizer)[0]
-            )
+            ).strip()
             rewritten_sentence = rewritten_sentences_dict.get(sent_idx)
 
             if rewritten_sentence is None:
@@ -385,7 +385,7 @@ async def main(cfg: SelfInterpTrainingConfig):
         tokenizer,
         submodule,
         sae,
-        batch_size=32,
+        batch_size=256,
     )
 
     # 5. Save Results
@@ -422,8 +422,8 @@ if __name__ == "__main__":
 
     cfg.eval_features = lora_results["config"]["eval_features"]
 
-    cfg.training_data_filename = "gpt4o_contrastive_rewriting_results.pkl"
-    cfg.api_model_name = "gpt-4o"
+    cfg.training_data_filename = "gpt41_contrastive_rewriting_results.pkl"
+    cfg.api_model_name = "gpt-4.1"
     print(f"Results will be saved to {cfg.training_data_filename}")
     # This is the standard way to run an async function from a sync context.
     asyncio.run(main(cfg))
