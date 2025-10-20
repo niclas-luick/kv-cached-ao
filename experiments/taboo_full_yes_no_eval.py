@@ -79,13 +79,13 @@ ADD_GENERATION_PROMPT = True
 ENABLE_THINKING = False
 
 EXPERIMENTS_DIR: str = "experiments/taboo_eval_results"
-OUTPUT_JSON_DIR: str = f"{EXPERIMENTS_DIR}/{model_name_str}_open_ended"
-OUTPUT_JSON_DIR: str = f"{EXPERIMENTS_DIR}/{model_name_str}_open_ended_direct"
+OUTPUT_JSON_DIR: str = f"{EXPERIMENTS_DIR}/{model_name_str}_yes_no"
+OUTPUT_JSON_DIR: str = f"{EXPERIMENTS_DIR}/{model_name_str}_yes_no_direct"
 
 os.makedirs(EXPERIMENTS_DIR, exist_ok=True)
 os.makedirs(OUTPUT_JSON_DIR, exist_ok=True)
 # Optional: save results to disk as JSON
-OUTPUT_JSON_TEMPLATE: Optional[str] = f"{OUTPUT_JSON_DIR}/" + "taboo_results_open_{lora}.json"
+OUTPUT_JSON_TEMPLATE: Optional[str] = f"{OUTPUT_JSON_DIR}/" + "taboo_results_yes_no_{lora}.json"
 
 # ========================================
 # PROMPT TYPES AND QUESTIONS
