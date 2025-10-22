@@ -56,12 +56,12 @@ if MODEL_NAME == "Qwen/Qwen3-32B":
 elif MODEL_NAME == "Qwen/Qwen3-8B":
     INVESTIGATOR_LORA_PATHS = [
         # "adamkarvonen/checkpoints_all_single_and_multi_pretrain_Qwen3-8B",
-        # "adamkarvonen/checkpoints_act_cls_pretrain_mix_Qwen3-8B",
-        # "adamkarvonen/checkpoints_cls_only_Qwen3-8B",
-        "adamkarvonen/checkpoints_all_single_and_multi_pretrain_cls_posttrain_Qwen3-8B",
+        "adamkarvonen/checkpoints_act_cls_pretrain_mix_Qwen3-8B",
+        "adamkarvonen/checkpoints_cls_only_Qwen3-8B",
+        # "adamkarvonen/checkpoints_all_single_and_multi_pretrain_cls_posttrain_Qwen3-8B",
         "adamkarvonen/checkpoints_latentqa_only_Qwen3-8B",
-        "adamkarvonen/checkpoints_all_single_and_multi_pretrain_cls_latentqa_posttrain_Qwen3-8B",
-        # "adamkarvonen/checkpoints_act_cls_latentqa_sae_pretrain_mix_Qwen3-8B",
+        # "adamkarvonen/checkpoints_all_single_and_multi_pretrain_cls_latentqa_posttrain_Qwen3-8B",
+        "adamkarvonen/checkpoints_act_cls_latentqa_sae_pretrain_mix_Qwen3-8B",
     ]
     ACTIVE_LORA_PATH_TEMPLATE: Optional[str] = (
         "/root/sae_introspect/model_lora_personaqa/Qwen3-8B-shuffled-{name}_10_epochs"
@@ -104,7 +104,7 @@ data_path = os.path.join(DATA_DIR, PERSONAS_FILENAME)
 if not os.path.exists(data_path):
     raise FileNotFoundError(f"Could not find {data_path}")
 
-MAX_PERSONAS: Optional[int] = 10
+MAX_PERSONAS: Optional[int] = None
 
 # Load dataset
 with open(data_path, "r") as f:
@@ -120,7 +120,12 @@ for persona in persona_data:
 
 PREFIX = "Answer with 'Yes' or 'No' only. "
 
-CONTEXT_PROMPTS: list[str] = ["What can you tell me about {name}?"]
+CONTEXT_PROMPTS: list[str] = [
+    # "Name: {name}. Prompt Template: What can you tell me about {name}?",
+    # "What can you tell me about {name}?",
+    "My name is {name}.",
+    # "What is the {prompt_type} of {name}?",
+]
 
 
 PROMPT_TYPES: list[str] = [
@@ -142,6 +147,16 @@ VERBALIZER_PROMPTS: list[str] = [
     "Is this person's favorite sport {favorite_sport}?",
     "Is this person's favorite boardgame {favorite_boardgame}?",
 ]
+
+
+# VERBALIZER_PROMPTS: list[str] = [
+#     "Is this country {country} related to this text?",
+#     "Is this food {favorite_food} related to this text?",
+#     "Is this drink {favorite_drink} related to this text?",
+#     "Is this music genre {favorite_music_genre} related to this text?",
+#     "Is this sport {favorite_sport} related to this text?",
+#     "Is this boardgame {favorite_boardgame} related to this text?",
+# ]
 
 # VERBALIZER_PROMPTS = [
 #     "Is the person in this text from the country {country}?",
@@ -407,7 +422,8 @@ for INVESTIGATOR_LORA_PATH in INVESTIGATOR_LORA_PATHS:
         for context_prompt, prompt_type, correct_word in itertools.product(
             CONTEXT_PROMPTS, PROMPT_TYPES, [True, False]
         ):
-            context_prompt = context_prompt.format(name=name)
+            formatted_prompt_type = prompt_type.replace("_", " ")
+            context_prompt = context_prompt.format(name=name, prompt_type=formatted_prompt_type)
             # Build a simple user message per persona
             test_message = [{"role": "user", "content": context_prompt}]
             message_dicts = [test_message]

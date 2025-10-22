@@ -1,22 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-"""
-Standalone evaluator for PersonaQA-style probing with NL-Probes.
-
-What it does:
-- Loads Qwen/Qwen3-8B and adds a dummy PEFT adapter so code paths expecting peft_config work.
-- Optionally loads an "active" LoRA to be measured against the base model.
-- For each persona, builds a simple user message of the form "What can you tell me about {name}?"
-- Collects activations for a set of layers with LoRA enabled and disabled, and computes the diff.
-- For each prompt type, builds training data from activations and runs the investigator LoRA evaluation.
-- Stores all responses, ground truth, prompt type, and mean ground-truth containment in a dictionary.
-
-Notes:
-- Designed for Python 3.11. Type hints use list and dict.
-- Keep an eye on VRAM. You can cap the number of personas with MAX_PERSONAS.
-"""
-
 import json
 import os
 from pathlib import Path
@@ -81,7 +62,7 @@ MAX_PERSONAS: Optional[int] = None  # set to an int to cap, or None for all
 # Optional: save results to disk as JSON
 OUTPUT_JSON: Optional[str] = "personaqa_probe_results_yes_no.json"
 
-CONTEXT_PROMPT: str = "Name: {name}. What can you tell me about {name}?"
+CONTEXT_PROMPT: str = "My name is {name}."
 
 # ========================================
 # PROMPT TYPES AND QUESTIONS

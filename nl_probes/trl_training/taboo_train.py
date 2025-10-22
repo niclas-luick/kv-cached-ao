@@ -27,7 +27,7 @@ MODEL_NAME_TO_BATCH_SIZE = {
     "Qwen/Qwen3-14B": 8,
     "Qwen/Qwen3-8B": 8,
     "mistralai/Mistral-Small-24B-Instruct-2501": 1,
-    "Qwen/Qwen3-32B": 4,
+    "Qwen/Qwen3-32B": 8,
 }
 
 
@@ -305,31 +305,99 @@ def create_incremental_turn_dataset(dataset: Dataset) -> Dataset:
     return Dataset.from_list(new_data)
 
 
-# def format_sft_dataset(ds: Dataset, max_length_chars: int) -> Dataset:
-#     rows = []
+def combine_with_ultrachat(
+    raw_train_ds: Dataset,
+    tokenized_train_ds: Dataset,
+    chat_dataset_name: str,
+    tokenizer: AutoTokenizer,
+    random_seed: int,
+    final_message_loss_only: bool,
+) -> Dataset:
+    """
+    Sample from UltraChat, filter to first turn only, filter by max character length
+    from the taboo dataset, then combine and shuffle with the main training data.
+    """
+    from datasets import concatenate_datasets
 
-#     for row in ds:
-#         prompt = row["instruction"]
-#         completion = row["response"]
+    num_train_examples = len(tokenized_train_ds)
+    print(f"Sampling {num_train_examples} examples from UltraChat")
 
-#         if len(prompt) + len(completion) > max_length_chars:
-#             continue
+    # Load UltraChat dataset
+    chat_ds = load_dataset(chat_dataset_name, split="train_sft", streaming=True)
 
-#         rows.append({"prompt": prompt, "completion": completion})
+    # Calculate max character length from taboo dataset
+    def get_message_char_length(example):
+        total_chars = 0
+        for msg in example["messages"]:
+            total_chars += len(msg["content"])
+        return total_chars
 
-#     return Dataset.from_list(rows)
+    max_char_length = max(get_message_char_length(ex) for ex in raw_train_ds)
+    print(f"Max character length in taboo dataset: {max_char_length}")
+
+    # Collect examples that pass criteria until we have enough
+    kept_examples = []
+    total_seen = 0
+
+    for example in chat_ds:
+        total_seen += 1
+        messages = example["messages"]
+
+        # Must have at least 2 messages
+        if len(messages) < 2:
+            continue
+
+        # Keep only first user-assistant exchange
+        truncated_messages = messages[:2]
+
+        # Calculate character length
+        char_length = sum(len(msg["content"]) for msg in truncated_messages)
+
+        # Only keep if within max length
+        if char_length <= max_char_length:
+            kept_examples.append({"messages": truncated_messages})
+
+            # Stop when we have enough
+            if len(kept_examples) >= num_train_examples:
+                break
+
+    print(f"\n=== FILTERING STATS ===")
+    print(f"Total examples examined: {total_seen}")
+    print(f"Examples kept: {len(kept_examples)}")
+    print(f"Examples filtered out: {total_seen - len(kept_examples)}")
+    print(f"Max allowed char length (from taboo): {max_char_length}")
+    print("======================\n")
+
+    chat_dataset = Dataset.from_list(kept_examples)
+    print(f"UltraChat examples after filtering: {len(chat_dataset)}")
+
+    # Tokenize the chat dataset
+    train_chat_ds = prepare_sft_dataset(chat_dataset, tokenizer, final_message_loss_only=final_message_loss_only)
+
+    # Combine datasets
+    combined_train_ds = concatenate_datasets([tokenized_train_ds, train_chat_ds])
+
+    # Shuffle
+    combined_train_ds = combined_train_ds.shuffle(seed=random_seed)
+
+    print(f"Combined dataset size: {len(combined_train_ds)}")
+    print(f"  - Taboo: {len(tokenized_train_ds)}")
+    print(f"  - UltraChat: {len(train_chat_ds)}")
+
+    return combined_train_ds
 
 
 if __name__ == "__main__":
     model_names = [
-        # "Qwen/Qwen3-8B",
+        "Qwen/Qwen3-8B",
         # "Qwen/Qwen3-14B",
         # "google/gemma-2-9b-it",
-        "Qwen/Qwen3-32B",
+        # "Qwen/Qwen3-32B",
         # "google/gemma-2-27b-it",
     ]
 
     dataset_name = "bcywinski/taboo-smile"
+    chat_dataset_name = "HuggingFaceH4/ultrachat_200k"
 
     dataset_names = [
         "bcywinski/taboo-ship",
@@ -393,13 +461,22 @@ if __name__ == "__main__":
         eval_percent = 0.1
         train_size = int(len(ds) * (1 - eval_percent))
         eval_size = int(len(ds) * eval_percent)
-        train_ds = ds.select(range(train_size))
+        raw_train_ds = ds.select(range(train_size))
         eval_ds = ds.select(range(train_size, train_size + eval_size))
 
         tokenizer = AutoTokenizer.from_pretrained(config.model_name)
 
-        train_ds = prepare_sft_dataset(train_ds, tokenizer, final_message_loss_only=final_message_loss_only)
+        train_ds = prepare_sft_dataset(raw_train_ds, tokenizer, final_message_loss_only=final_message_loss_only)
         eval_ds = prepare_sft_dataset(eval_ds, tokenizer, final_message_loss_only=final_message_loss_only)
+
+        train_ds = combine_with_ultrachat(
+            raw_train_ds=raw_train_ds,
+            tokenized_train_ds=train_ds,
+            chat_dataset_name=chat_dataset_name,
+            tokenizer=tokenizer,
+            random_seed=config.random_seed,
+            final_message_loss_only=final_message_loss_only,
+        )
 
         early_stopping_callback = EarlyStoppingCallback(early_stopping_patience=2)
 

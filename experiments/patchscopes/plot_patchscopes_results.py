@@ -4,16 +4,16 @@ from pathlib import Path
 from collections import defaultdict
 import matplotlib.pyplot as plt
 import numpy as np
+import re
+import unicodedata
 
 # Configuration
-OUTPUT_JSON_DIR = "experiments/personaqa_single_eval_results_all/Qwen3-8B_yes_no_v1"
-# OUTPUT_JSON_DIR = "experiments/personaqa_single_eval_results/Qwen3-8B_yes_no"
-# OUTPUT_JSON_DIR = "experiments/personaqa_all_persona_eval_results/Qwen3-8B_yes_no"
+OUTPUT_JSON_DIR = "experiments/patchscopes_eval_results/Qwen3-8B_open_ended"
 
 DATA_DIR = OUTPUT_JSON_DIR.split("/")[-1]
 
 IMAGE_FOLDER = "images"
-CLS_IMAGE_FOLDER = f"{IMAGE_FOLDER}/personaqa"
+CLS_IMAGE_FOLDER = f"{IMAGE_FOLDER}/patchscopes"
 os.makedirs(IMAGE_FOLDER, exist_ok=True)
 os.makedirs(CLS_IMAGE_FOLDER, exist_ok=True)
 
@@ -33,17 +33,10 @@ if "open_ended" in DATA_DIR:
 elif "yes_no" in DATA_DIR:
     task_type = "Yes / No"
 
-if "single" in OUTPUT_JSON_DIR:
-    person_type = " (Single Persona per LoRA)"
-    person_str = "single_persona"
-else:
-    person_type = ""
-    person_str = "all_persona"
-
-TITLE = f"PersonAQA{person_type} Results: {task_type} Response with {sequence_str.capitalize()}-Level Inputs for {model_name}"
+TITLE = f"PatchScopes Eval Results: {task_type} Response with {sequence_str.capitalize()}-Level Inputs for {model_name}"
 
 
-OUTPUT_PATH = f"{CLS_IMAGE_FOLDER}/personaqa_results_{DATA_DIR}_{sequence_str}_{person_str}.png"
+OUTPUT_PATH = f"{CLS_IMAGE_FOLDER}/patchscopes_results_{DATA_DIR}_{sequence_str}.png"
 
 
 # Filter filenames - skip files containing any of these strings
@@ -62,23 +55,45 @@ CUSTOM_LABELS = {
     "checkpoints_act_latentqa_pretrain_mix_Qwen3-8B": "Past Lens + LatentQA Pretrain Mix",
 }
 
+def parse_answer(s: str) -> str:
+    """Normalize an answer to a simple whitespace-separated, ASCII lowercase form."""
+    if s is None:
+        return ""
+    s = s.strip()
+
+    # Decode literal escapes like "\u00ed" when present
+    if "\\u" in s or "\\x" in s:
+        try:
+            s = s.encode("utf-8").decode("unicode_escape")
+        except Exception:
+            pass
+
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = re.sub(r"[^0-9A-Za-z]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip().lower()
+    return s
+
 
 def calculate_accuracy(record):
     if SEQUENCE:
-        ground_truth = record["ground_truth"].lower()
+        ground_truth = parse_answer(record["ground_truth"])
         full_seq_responses = record["full_sequence_responses"]
 
-        num_correct = sum(1 for resp in full_seq_responses if ground_truth in resp.lower())
+        num_correct = sum(1 for resp in full_seq_responses if ground_truth in parse_answer(resp))
         total = len(full_seq_responses)
 
         return num_correct / total if total > 0 else 0
     else:
         ground_truth = record["ground_truth"].lower()
-        responses = record["token_responses"][-7:-6]
+        idx = -10
+        responses = record["token_responses"][idx:idx + 1]
         # responses = record["token_responses"][-9:]
         # responses = record["token_responses"][-12:]
 
-        num_correct = sum(1 for resp in responses if ground_truth in resp.lower())
+        ground_truth = parse_answer(ground_truth)
+
+        num_correct = sum(1 for resp in responses if ground_truth in parse_answer(resp))
         total = len(responses)
 
         return num_correct / total if total > 0 else 0
@@ -117,10 +132,10 @@ def load_results(json_dir):
         # Calculate accuracy for each record
         for record in data["records"]:
             accuracy = calculate_accuracy(record)
-            # word = record["word"]
+            word = record["source_file"]
 
             results_by_lora[investigator_lora].append(accuracy)
-            # results_by_lora_word[investigator_lora][word].append(accuracy)
+            results_by_lora_word[investigator_lora][word].append(accuracy)
 
     return results_by_lora, results_by_lora_word
 
@@ -190,6 +205,15 @@ def plot_results(results_by_lora):
     ax.set_ylim(0, 1)
     ax.grid(axis="y", alpha=0.3)
 
+    # Add horizontal baseline line for zero-shot reference
+    baseline_line = ax.axhline(
+        y=0.51,
+        color="black",
+        linestyle="--",
+        linewidth=2,
+        label="Zero-shot Skyline (0.51)",
+    )
+
     # Add value labels on bars
     for i, (bar, acc, err) in enumerate(zip(bars, mean_accuracies, error_bars)):
         height = bar.get_height()
@@ -210,10 +234,20 @@ def plot_results(results_by_lora):
         else:
             legend_labels.append(name)
 
-    ax.legend(bars, legend_labels, loc="upper center", bbox_to_anchor=(0.5, -0.15), fontsize=10, ncol=2, frameon=False)
+    legend_handles = list(bars) + [baseline_line]
+    legend_labels = legend_labels + [baseline_line.get_label()]
+    ax.legend(
+        legend_handles,
+        legend_labels,
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.18),
+        fontsize=10,
+        ncol=2,
+        frameon=False,
+    )
 
     plt.tight_layout()
-    plt.subplots_adjust(bottom=0.2)  # Make room for legend below
+    plt.subplots_adjust(bottom=0.22)  # Make room for legend below
     plt.savefig(OUTPUT_PATH, dpi=300, bbox_inches="tight")
     print(f"\nPlot saved as '{OUTPUT_PATH}'")
     plt.show()
@@ -248,6 +282,19 @@ def plot_per_word_accuracy(results_by_lora_word):
         ax.set_ylim(0, 1)
         ax.grid(axis="y", alpha=0.3)
 
+        # Annotate each bar with its mean accuracy
+        for bar, mean_acc, err in zip(bars, mean_accs, error_bars):
+            height = bar.get_height()
+            offset = np.nan_to_num(err, nan=0.0) + 0.02
+            ax.text(
+                bar.get_x() + bar.get_width() / 2.0,
+                height + offset,
+                f"{mean_acc:.3f}",
+                ha="center",
+                va="bottom",
+                fontsize=9,
+            )
+
         # Add horizontal line for overall mean
         overall_mean = sum(mean_accs) / len(mean_accs)
         ax.axhline(y=overall_mean, color="red", linestyle="--", label=f"Overall mean: {overall_mean:.3f}", linewidth=2)
@@ -269,7 +316,7 @@ def main():
     plot_results(results_by_lora)
 
     # Plot 2: Per-word accuracy for each investigator
-    # plot_per_word_accuracy(results_by_lora_word)
+    plot_per_word_accuracy(results_by_lora_word)
 
 
 if __name__ == "__main__":

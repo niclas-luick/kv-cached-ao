@@ -1,21 +1,9 @@
-"""
-Simple, hackable batch evaluator for Patchscopes-style factual datasets.
-
-- Iterates over all .tsv files in `datasets/factual`
-- Builds a plain chat prompt per row (zero-shot)
-- Uses vLLM to generate answers (temperature=0)
-- Computes accuracy per file and prints a dict {filename: accuracy}
-
-Keep it simple and easy to tweak.
-"""
-
-from __future__ import annotations
-
 import ast
 import os
 import re
 import unicodedata
 from typing import List, Tuple
+import json
 
 import pandas as pd
 import vllm
@@ -23,7 +11,6 @@ import vllm
 from nl_probes.utils.common import load_tokenizer
 
 
-# Folder with .tsv datasets (relative to this file)
 FOLDER = os.path.join("datasets", "factual")
 
 # Base model to query via vLLM
@@ -32,6 +19,14 @@ VLLM_MODEL_NAME = "Qwen/Qwen3-8B"
 # vLLM generation config
 MAX_NEW_TOKENS = 10
 TEMPERATURE = 0.0
+
+MAX_PROMPTS: int = 200
+
+EXPERIMENTS_DIR: str = "experiments/patchscopes_eval_results"
+os.makedirs(EXPERIMENTS_DIR, exist_ok=True)
+
+model_name_str = VLLM_MODEL_NAME.split("/")[-1].replace(".", "_")
+OUTPUT_FILENAME = f"{EXPERIMENTS_DIR}/patchscopes_zero-shot_{model_name_str}.json"
 
 # Prompt template (kept close to the original zero-shot version)
 PROMPT_TEMPLATE = (
@@ -72,6 +67,8 @@ def build_prompts_and_targets(df: pd.DataFrame, tokenizer) -> Tuple[List[str], L
     targets: list[str] = []
 
     for _, row in df.iterrows():
+        if len(prompts) >= MAX_PROMPTS:
+            break
         # Build the context prefix up to the source position
         source_toks = ast.literal_eval(row["source_cropped_toks"])  # list[str]
         source_pos = int(row["position_source"])
@@ -143,18 +140,30 @@ def main() -> None:
 
     for fname in tsv_files:
         fpath = os.path.join(FOLDER, fname)
-        try:
-            acc, items = evaluate_dataset_file(fpath, llm, tokenizer)
-        except Exception as e:
-            # Keep it running even if a file fails; mark accuracy as -1.0
-            print(f"Error evaluating {fname}: {e}")
-            acc = -1.0
-            items = []
+        acc, items = evaluate_dataset_file(fpath, llm, tokenizer)
         results[fname] = acc
         details[fname] = items
 
+    # Compute mean accuracy over all items (not per-dataset mean)
+    total_items = sum(len(items) for items in details.values())
+    total_correct = sum(results[fname] * len(details[fname]) for fname in results.keys())
+    mean_accuracy_all_items = total_correct / total_items
+
+    # Include overall mean accuracy in the results dictionary
+    results["mean_accuracy_all_items"] = mean_accuracy_all_items
+
     print(results)
     # print(details)
+
+    data = {
+        "results": results,
+        "details": details,
+    }
+
+    with open(OUTPUT_FILENAME, "w") as f:
+        json.dump(data, f)
+
+
 
 
 if __name__ == "__main__":

@@ -4,6 +4,24 @@ import matplotlib.pyplot as plt
 import numpy as np
 import os
 
+TITLE_FONT_SIZE = 24
+LABEL_FONT_SIZE = 20
+TICK_FONT_SIZE = 16
+LEGEND_FONT_SIZE = 18
+VALUE_LABEL_FONT_SIZE = 16
+
+# Ensure Matplotlib defaults are scaled up consistently
+plt.rcParams.update(
+    {
+        "font.size": LABEL_FONT_SIZE,
+        "axes.titlesize": TITLE_FONT_SIZE,
+        "axes.labelsize": LABEL_FONT_SIZE,
+        "xtick.labelsize": TICK_FONT_SIZE,
+        "ytick.labelsize": TICK_FONT_SIZE,
+        "legend.fontsize": LEGEND_FONT_SIZE,
+    }
+)
+
 # Configuration
 EXPERIMENTS_DIR = "experiments"
 DATA_DIR = "classification_eval_Qwen3-32B_single_token"
@@ -22,21 +40,22 @@ FILTERED_FILENAMES = [
     "latentqa_only",
 ]
 
-# Mapping from JSON filename to bar chart label
-# JSON_TO_LABEL = {
-#     "classification_results_lora_checkpoints_act_pretrain_cls_latentqa_mix_posttrain_Qwen3-32B.json": "Past / Future Lens -> Classification + LatentQA Posttrain",
-#     "classification_results_lora_checkpoints_act_pretrain_cls_only_posttrain_Qwen3-32B.json": "Past / Future Lens -> Classification Only Posttrain",
-#     "classification_results_lora_checkpoints_classification_only_Qwen3-32B.json": "Past / Future Lens -> Classification Only",
-#     "classification_results_lora_checkpoints_latentqa_only_Qwen3-32B.json": "Past / Future Lens -> LatentQA Only",
-# }
-
-JSON_TO_LABEL = {
-    "classification_results_lora_checkpoints_act_cls_pretrain_mix_Qwen3-8B.json": "Past / Future Lens + Classification Pretrain Mix",
-    "classification_results_lora_checkpoints_act_single_and_multi_pretrain_cls_posttrain_Qwen3-8B.json": "Past / Future Lens Pretrain -> Classification Posttrain",
-    "classification_results_lora_checkpoints_all_single_and_multi_pretrain_cls_latentqa_posttrain_Qwen3-8B.json": "Past / Future Lens + SAE Pretrain -> Classification + LatentQA Posttrain",
-    "classification_results_lora_checkpoints_all_single_and_multi_pretrain_cls_posttrain_Qwen3-8B.json": "Past / Future Lens + SAE Pretrain -> Classification Posttrain",
-    "classification_results_lora_checkpoints_cls_only_Qwen3-8B.json": "Classification Only",
-}
+if "Qwen3-32B" in DATA_DIR:
+    # Mapping from JSON filename to bar chart label
+    JSON_TO_LABEL = {
+        "classification_results_lora_checkpoints_act_pretrain_cls_latentqa_mix_posttrain_Qwen3-32B.json": "Past / Future Lens -> Classification + LatentQA Posttrain",
+        "classification_results_lora_checkpoints_act_pretrain_cls_only_posttrain_Qwen3-32B.json": "Past / Future Lens -> Classification Only Posttrain",
+        "classification_results_lora_checkpoints_classification_only_Qwen3-32B.json": "Past / Future Lens -> Classification Only",
+        "classification_results_lora_checkpoints_latentqa_only_Qwen3-32B.json": "Past / Future Lens -> LatentQA Only",
+    }
+elif "Qwen3-8B" in DATA_DIR:
+    JSON_TO_LABEL = {
+        "classification_results_lora_checkpoints_act_cls_pretrain_mix_Qwen3-8B.json": "Past / Future Lens + Classification Pretrain Mix",
+        "classification_results_lora_checkpoints_act_single_and_multi_pretrain_cls_posttrain_Qwen3-8B.json": "Past / Future Lens Pretrain -> Classification Posttrain",
+        "classification_results_lora_checkpoints_all_single_and_multi_pretrain_cls_latentqa_posttrain_Qwen3-8B.json": "Past / Future Lens + SAE Pretrain -> Classification + LatentQA Posttrain",
+        "classification_results_lora_checkpoints_all_single_and_multi_pretrain_cls_posttrain_Qwen3-8B.json": "Past / Future Lens + SAE Pretrain -> Classification Posttrain",
+        "classification_results_lora_checkpoints_cls_only_Qwen3-8B.json": "Classification Only",
+    }
 
 # Dataset groupings
 IID_DATASETS = [
@@ -151,38 +170,60 @@ def plot_accuracies(results, output_path=None):
     # IID plot
     x_pos = np.arange(len(labels))
     bars1 = ax1.bar(x_pos, iid_accs, color=colors, alpha=0.8, yerr=iid_cis, capsize=5)
-    ax1.set_ylabel("Accuracy", fontsize=12, fontweight="bold")
-    ax1.set_title("IID Dataset Accuracy", fontsize=14, fontweight="bold")
+    ax1.set_ylabel("Accuracy", fontsize=LABEL_FONT_SIZE, fontweight="bold")
+    ax1.set_title("IID Dataset Accuracy", fontsize=TITLE_FONT_SIZE, fontweight="bold")
     ax1.set_xticks([])
-    ax1.set_ylim([0, 1])
+    # ax1.set_ylim([0, 1])
+    ax1.tick_params(axis="both", labelsize=TICK_FONT_SIZE)
     ax1.grid(axis="y", alpha=0.3)
 
     # Add value labels on bars
     for bar in bars1:
         height = bar.get_height()
-        ax1.text(bar.get_x() + bar.get_width() / 2.0, height, f"{height:.1%}", ha="center", va="bottom", fontsize=9)
-
-    # Add legend below the IID plot
-    legend_labels = [f"{label}" for i, label in enumerate(labels)]
-    ax1.legend(bars1, legend_labels, loc="upper center", bbox_to_anchor=(0.5, -0.15), ncol=1, frameon=True, fontsize=9)
+        ax1.text(
+            bar.get_x() + bar.get_width() / 2.0,
+            height,
+            f"{height:.1%}",
+            ha="center",
+            va="bottom",
+            fontsize=VALUE_LABEL_FONT_SIZE,
+        )
 
     # OOD plot
     bars2 = ax2.bar(x_pos, ood_accs, color=colors, alpha=0.8, yerr=ood_cis, capsize=5)
-    ax2.set_ylabel("Accuracy", fontsize=12, fontweight="bold")
-    ax2.set_title("OOD Dataset Accuracy", fontsize=14, fontweight="bold")
+    ax2.set_ylabel("Accuracy", fontsize=LABEL_FONT_SIZE, fontweight="bold")
+    ax2.set_title("OOD Dataset Accuracy", fontsize=TITLE_FONT_SIZE, fontweight="bold")
     ax2.set_xticks([])
-    ax2.set_ylim([0, 1])
+    # ax2.set_ylim([0, 1])
+    ax2.tick_params(axis="both", labelsize=TICK_FONT_SIZE)
     ax2.grid(axis="y", alpha=0.3)
 
     # Add value labels on bars
     for bar in bars2:
         height = bar.get_height()
-        ax2.text(bar.get_x() + bar.get_width() / 2.0, height, f"{height:.1%}", ha="center", va="bottom", fontsize=9)
+        ax2.text(
+            bar.get_x() + bar.get_width() / 2.0,
+            height,
+            f"{height:.1%}",
+            ha="center",
+            va="bottom",
+            fontsize=VALUE_LABEL_FONT_SIZE,
+        )
 
-    # Add legend below the OOD plot
-    ax2.legend(bars2, legend_labels, loc="upper center", bbox_to_anchor=(0.5, -0.15), ncol=1, frameon=True, fontsize=9)
+    # Shared legend centered beneath both plots
+    legend_labels = [f"{label}" for label in labels]
+    legend_columns = min(len(legend_labels), 1) or 1
+    fig.legend(
+        bars1,
+        legend_labels,
+        loc="lower center",
+        bbox_to_anchor=(0.5, -0.02),
+        ncol=legend_columns,
+        frameon=True,
+        fontsize=LEGEND_FONT_SIZE,
+    )
 
-    plt.tight_layout()
+    plt.tight_layout(pad=2.0, rect=(0, 0.12, 1, 1))
 
     if output_path:
         plt.savefig(output_path, dpi=300, bbox_inches="tight")
