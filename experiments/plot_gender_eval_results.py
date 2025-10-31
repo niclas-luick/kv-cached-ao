@@ -65,6 +65,17 @@ CUSTOM_LABELS = {
     "checkpoints_cls_latentqa_sae_addition_Qwen3-8B": "SAE + LatentQA + Classification",
 }
 
+def gender_comparison(resp: str, ground_truth: str) -> bool:
+    "We use 'Male' and 'Female', so 'Male' is in 'Female'. So we have to be careful."
+    resp = resp.lower()
+    ground_truth = ground_truth.lower()
+
+    if ground_truth == "female":
+        return ground_truth in resp
+    elif ground_truth == "male":
+        return ground_truth in resp and "female" not in resp
+    else:
+        raise ValueError(f"Unknown ground truth gender: {ground_truth}")
 
 def calculate_accuracy(record):
     if SEQUENCE:
@@ -72,7 +83,7 @@ def calculate_accuracy(record):
         full_seq_responses = record["full_sequence_responses"]
         full_seq_responses = record["control_token_responses"]
 
-        num_correct = sum(1 for resp in full_seq_responses if ground_truth in resp.lower())
+        num_correct = sum(1 for resp in full_seq_responses if gender_comparison(resp, ground_truth))
         total = len(full_seq_responses)
 
         return num_correct / total if total > 0 else 0
@@ -82,7 +93,7 @@ def calculate_accuracy(record):
         responses = record["token_responses"][-1:]
         # responses = record["token_responses"][-9:-6]
 
-        num_correct = sum(1 for resp in responses if ground_truth in resp.lower())
+        num_correct = sum(1 for resp in responses if gender_comparison(resp, ground_truth))
         total = len(responses)
 
         return num_correct / total if total > 0 else 0
