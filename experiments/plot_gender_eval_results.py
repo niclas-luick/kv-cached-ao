@@ -4,6 +4,7 @@ from pathlib import Path
 from collections import defaultdict
 import matplotlib.pyplot as plt
 import numpy as np
+import re
 
 # Configuration
 OUTPUT_JSON_DIR = "experiments/gender_eval_results/gemma-2-9b-it_open_ended_all_direct"
@@ -67,19 +68,24 @@ CUSTOM_LABELS = {
 
 def gender_comparison(resp: str, ground_truth: str) -> bool:
     "We use 'Male' and 'Female', so 'Male' is in 'Female'. So we have to be careful."
-    resp = resp.lower()
-    ground_truth = ground_truth.lower()
+    resp = resp.lower().strip()
+    ground_truth = ground_truth.lower().strip()
 
+    male_present = re.search(r"\bmales?\b", resp) is not None
+    female_present = re.search(r"\bfemales?\b", resp) is not None
+
+    if male_present and female_present:
+        raise ValueError(f"Ambiguous response contains both male and female: {resp}")
+
+    if ground_truth == "male":
+        return male_present
     if ground_truth == "female":
-        return ground_truth in resp
-    elif ground_truth == "male":
-        return ground_truth in resp and "female" not in resp
-    else:
-        raise ValueError(f"Unknown ground truth gender: {ground_truth}")
+        return female_present
+    raise ValueError(f"Unknown ground truth gender: {ground_truth}")
 
 def calculate_accuracy(record):
     if SEQUENCE:
-        ground_truth = record["ground_truth"].lower()
+        ground_truth = record["ground_truth"]
         full_seq_responses = record["full_sequence_responses"]
         full_seq_responses = record["control_token_responses"]
 
