@@ -23,10 +23,8 @@ plt.rcParams.update(
 )
 
 # Configuration
-EXPERIMENTS_DIR = "experiments"
-DATA_DIR = "classification_eval_Qwen3-32B_single_token"
-DATA_DIR = "classification_eval_Qwen3-8B_single_token"
-INPUT_FOLDER = f"{EXPERIMENTS_DIR}/{DATA_DIR}/"
+RUN_DIR = "experiments/classification/classification_eval_Qwen3-8B_single_token"
+DATA_DIR = RUN_DIR.split("/")[-1]
 
 IMAGE_FOLDER = "images"
 CLS_IMAGE_FOLDER = f"{IMAGE_FOLDER}/classification_eval"
@@ -37,25 +35,23 @@ OUTPUT_PATH = f"{CLS_IMAGE_FOLDER}/classification_results_{DATA_DIR}.png"
 
 # Filter out files containing any of these strings
 FILTERED_FILENAMES = [
-    "latentqa_only",
 ]
 
-if "Qwen3-32B" in DATA_DIR:
-    # Mapping from JSON filename to bar chart label
-    JSON_TO_LABEL = {
-        "classification_results_lora_checkpoints_act_pretrain_cls_latentqa_mix_posttrain_Qwen3-32B.json": "Past / Future Lens -> Classification + LatentQA Posttrain",
-        "classification_results_lora_checkpoints_act_pretrain_cls_only_posttrain_Qwen3-32B.json": "Past / Future Lens -> Classification Only Posttrain",
-        "classification_results_lora_checkpoints_classification_only_Qwen3-32B.json": "Past / Future Lens -> Classification Only",
-        "classification_results_lora_checkpoints_latentqa_only_Qwen3-32B.json": "Past / Future Lens -> LatentQA Only",
-    }
-elif "Qwen3-8B" in DATA_DIR:
-    JSON_TO_LABEL = {
-        "classification_results_lora_checkpoints_act_cls_pretrain_mix_Qwen3-8B.json": "Past / Future Lens + Classification Pretrain Mix",
-        "classification_results_lora_checkpoints_act_single_and_multi_pretrain_cls_posttrain_Qwen3-8B.json": "Past / Future Lens Pretrain -> Classification Posttrain",
-        "classification_results_lora_checkpoints_all_single_and_multi_pretrain_cls_latentqa_posttrain_Qwen3-8B.json": "Past / Future Lens + SAE Pretrain -> Classification + LatentQA Posttrain",
-        "classification_results_lora_checkpoints_all_single_and_multi_pretrain_cls_posttrain_Qwen3-8B.json": "Past / Future Lens + SAE Pretrain -> Classification Posttrain",
-        "classification_results_lora_checkpoints_cls_only_Qwen3-8B.json": "Classification Only",
-    }
+JSON_TO_LABEL = {
+    # gemma 2 9b
+    "checkpoints_cls_latentqa_only_addition_gemma-2-9b-it": "Classification + LatentQA",
+    "checkpoints_latentqa_only_addition_gemma-2-9b-it": "LatentQA",
+    "checkpoints_cls_only_addition_gemma-2-9b-it": "Classification",
+    "checkpoints_latentqa_cls_past_lens_addition_gemma-2-9b-it": "Past Lens + LatentQA + Classification",
+
+    # qwen3 8b
+
+    "checkpoints_cls_latentqa_only_addition_Qwen3-8B": "Classification + LatentQA",
+    "checkpoints_latentqa_only_addition_Qwen3-8B": "LatentQA",
+    "checkpoints_cls_only_addition_Qwen3-8B": "Classification",
+    "checkpoints_latentqa_cls_past_lens_addition_Qwen3-8B": "Past Lens + LatentQA + Classification",
+    "checkpoints_cls_latentqa_sae_addition_Qwen3-8B": "SAE + LatentQA + Classification",
+}
 
 # Dataset groupings
 IID_DATASETS = [
@@ -233,8 +229,8 @@ def plot_accuracies(results, output_path=None):
 
 
 def main():
-    print(f"Loading results from: {INPUT_FOLDER}\n")
-    results = load_results_from_folder(INPUT_FOLDER)
+    print(f"Loading results from: {RUN_DIR}\n")
+    results = load_results_from_folder(RUN_DIR)
 
     if not results:
         print("No JSON files found in the specified folder!")
