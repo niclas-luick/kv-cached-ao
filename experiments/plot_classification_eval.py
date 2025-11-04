@@ -26,6 +26,7 @@ plt.rcParams.update(
 RUN_DIR = "experiments/classification/classification_eval_Qwen3-8B_single_token"
 RUN_DIR = "experiments/classification/classification_Qwen3-8B_single_token_v1"
 RUN_DIR = "experiments/classification/classification_Qwen3-8B_single_token"
+# RUN_DIR = "experiments/classification/classification_Qwen3-8B_multi_token"
 DATA_DIR = RUN_DIR.split("/")[-1]
 
 # Verbose printing toggle for per-dataset accuracies
@@ -79,8 +80,17 @@ OOD_DATASETS = [
     "ag_news",
     "language_identification",
     "singular_plural",
+    "engels_headline_istrump",
+    "engels_headline_isobama",
+    "engels_headline_ischina",
+    "engels_hist_fig_ismale",
+    "engels_news_class_politics",
+    "engels_wikidata_isjournalist",
+    "engels_wikidata_isathlete",
+    "engels_wikidata_ispolitician",
+    "engels_wikidata_issinger",
+    "engels_wikidata_isresearcher",
 ]
-
 
 def calculate_accuracy(records, dataset_ids):
     """Calculate accuracy for specified datasets."""
