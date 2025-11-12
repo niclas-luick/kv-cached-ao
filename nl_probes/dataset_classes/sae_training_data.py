@@ -3,6 +3,7 @@ import random
 import re
 from dataclasses import asdict, dataclass, field
 from typing import Literal
+import json
 
 import torch
 from tqdm import tqdm
@@ -598,82 +599,6 @@ def construct_train_dataset(
         training_data.append(training_data_point)
 
     return training_data
-
-
-def construct_eval_dataset(
-    cfg: SelfInterpTrainingConfig,
-    dataset_size: int,
-    input_prompt: str,
-    eval_feature_indices: list[int],
-    api_data: dict,
-    sae: BaseSAE,
-    tokenizer: AutoTokenizer,
-    enable_thinking: bool = False,
-) -> list[TrainingDataPoint]:
-    """Every prompt is exactly the same - the only difference is the steering vectors."""
-
-    input_messages = [{"role": "user", "content": input_prompt}]
-
-    input_prompt_ids = tokenizer.apply_chat_template(
-        input_messages,
-        tokenize=True,
-        add_generation_prompt=True,
-        return_tensors=None,
-        padding=False,
-        enable_thinking=enable_thinking,
-    )
-    if not isinstance(input_prompt_ids, list):
-        raise TypeError("Expected list of token ids from tokenizer")
-    # Set [-100] for user prompts
-    labels = [-100] * len(input_prompt_ids)
-
-    orig_prompt_length = len(input_prompt_ids)
-
-    x_token_id = tokenizer.encode("X", add_special_tokens=False)[0]
-
-    eval_data = []
-
-    first_position = None
-
-    for i in tqdm(range(dataset_size), desc="Constructing eval dataset"):
-        target_feature_idx = eval_feature_indices[i]
-
-        # 2. Prepare feature vectors for steering
-        # We use decoder weights (W_dec) as they map from the feature space back to the residual stream.
-        if cfg.use_decoder_vectors:
-            feature_vector = sae.W_dec[target_feature_idx].clone()
-        else:
-            feature_vector = sae.W_enc[:, target_feature_idx].clone()
-
-        positions = []
-        for i in range(orig_prompt_length):
-            if input_prompt_ids[i] == x_token_id:
-                positions.append(i)
-
-        assert len(positions) == 1, "Expected exactly one X token"
-
-        if first_position is None:
-            first_position = positions[0]
-        else:
-            assert positions[0] == first_position, "Expected all positions to be the same"
-        assert len(input_prompt_ids) > 0
-
-        eval_data_point = TrainingDataPoint(
-            datapoint_type="eval",
-            input_ids=input_prompt_ids,
-            labels=labels,
-            layer=sae.hook_layer,
-            steering_vectors=feature_vector,
-            positions=positions,
-            feature_idx=target_feature_idx,
-            target_output="",
-            context_input_ids=None,
-            context_positions=None,
-        )
-
-        eval_data.append(eval_data_point)
-
-    return eval_data
 
 
 def load_sae_data_from_sft_data_file(

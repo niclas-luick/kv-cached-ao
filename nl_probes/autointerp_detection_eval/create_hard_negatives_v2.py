@@ -353,7 +353,7 @@ if __name__ == "__main__":
     max_idx = 50_600
     target_features = list(range(min_idx, max_idx))
 
-    data_folder = "data"
+    data_folder = "sae_data"
     os.makedirs(data_folder, exist_ok=True)
 
     for sae_layer_percent in [25, 50, 75]:

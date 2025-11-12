@@ -7,25 +7,32 @@ from openai import AsyncOpenAI
 from pydantic import BaseModel
 from slist import Group, Slist
 
-from detection_eval.caller import (
+from nl_probes.autointerp_detection_eval.caller import (
     Caller,
     ChatHistory,
     ContentPolicyError,
     InferenceConfig,
     OpenAICaller,
     load_multi_caller,
-    load_pooled_openai_caller,
+    load_openai_caller,
     read_jsonl_file_into_basemodel,
     write_jsonl_file_from_basemodel,
 )
-from detection_eval.detection_basemodels import (
+from nl_probes.autointerp_detection_eval.detection_basemodels import (
     SAEV2,
     SAEActivationsV2,
     SAEInfo,
     SentenceInfoV2,
     TokenActivationV2,
 )
-from detection_eval.steering_hooks import get_introspection_prompt
+from nl_probes.utils.dataset_utils import get_introspection_prefix
+
+
+EXPLANATION_PROMPT = "Can you explain to me what this concept means?"
+
+
+def get_introspection_prompt(sae_layer: int, num_positions: int) -> str:
+    return f"{get_introspection_prefix(sae_layer, num_positions)}{EXPLANATION_PROMPT}"
 
 
 class ModelInfo(BaseModel):
@@ -111,12 +118,16 @@ def _activation_vector_str_v2(sentence: SentenceInfoV2) -> str:
     for pos, token in enumerate(sentence.tokens):
         if pos in act_tokens:
             # assert same token
-            assert act_tokens[pos].s == token, f"Token mismatch at position {pos}: {act_tokens[pos].s} != {token}. {act_tokens=}\n{sentence.tokens=}"
+            assert act_tokens[pos].s == token, (
+                f"Token mismatch at position {pos}: {act_tokens[pos].s} != {token}. {act_tokens=}\n{sentence.tokens=}"
+            )
             reconstructed_act_tokens.append(act_tokens[pos])
         else:
             reconstructed_act_tokens.append(TokenActivationV2(s=token, act=0, pos=pos))
 
-    assert len(reconstructed_act_tokens) == len(sentence.tokens), f"Reconstructed act tokens length mismatch: {len(reconstructed_act_tokens)} != {len(sentence.tokens)}"
+    assert len(reconstructed_act_tokens) == len(sentence.tokens), (
+        f"Reconstructed act tokens length mismatch: {len(reconstructed_act_tokens)} != {len(sentence.tokens)}"
+    )
     activation_vector = Slist(reconstructed_act_tokens).map(lambda x: x.to_prompt_str())
     return f"{activation_vector}"
 
@@ -987,7 +998,7 @@ async def main(
     print(f"Loaded {len(split_sae_activations)} valid SAE entries")
 
     # Create caller
-    caller = load_pooled_openai_caller(cache_path="cache/sae_explanations")
+    caller = load_openai_caller(cache_path="cache/sae_explanations")
     # Custom caller for gemma
 
     total_tokens = 0
@@ -1052,13 +1063,25 @@ async def main(
 
     # Run evaluations for each model's explanations
     detection_config = InferenceConfig(
-        model="gpt-5-mini-2025-08-07",
-        # model="gpt-5-nano-2025-08-07",
+        model=MODEL_NAME,
         max_completion_tokens=10_000,
         reasoning_effort="minimal",  # seems good enough
         # reasoning_effort="medium",
         temperature=1.0,
     )
+
+    # if MODEL_NAME == "gpt-4.1-mini":
+    #     detection_config.max_completion_tokens = None
+    #     detection_config.max_tokens = 10_000
+    #     detection_config.reasoning_effort = None
+    #     temperature = 0.0
+    # elif MODEL_NAME == "gpt-5-mini-2025-08-07":
+    #     detection_config.max_completion_tokens = 10_000
+    #     detection_config.max_tokens = None
+    #     detection_config.reasoning_effort = "minimal"
+    #     temperature = 1.0
+    # else:
+    #     raise ValueError(f"Unknown model: {MODEL_NAME}")
 
     total_tokens = 0
     for target_sae in all_explanations:
@@ -1167,14 +1190,25 @@ async def main(
     # plot_precision_vs_recall_by_model(groupby_by_model, rename_map)
 
 
+# MODEL_NAME = "gpt-4.1-mini"
+MODEL_NAME = "gpt-5-mini-2025-08-07"
+
 if __name__ == "__main__":
     # Define explainer models to test
     explainer_models = Slist(
         [
+            # ModelInfo(
+            #     # model="gpt-5-mini-2025-08-07",
+            #     model=MODEL_NAME,
+            #     display_name=f"{MODEL_NAME}<br>(extrospecting<br>sentences)",
+            #     reasoning_effort="minimal",
+            #     # reasoning_effort="medium",
+            # ),
             ModelInfo(
-                model="gpt-5-mini-2025-08-07",
-                display_name="GPT-5-mini<br>(extrospecting<br>sentences)",
-                reasoning_effort="low",
+                # model="gpt-5-mini-2025-08-07",
+                model=MODEL_NAME,
+                display_name=f"{MODEL_NAME}<br>(extrospecting<br>sentences)",
+                reasoning_effort="minimal",
                 # reasoning_effort="medium",
             ),
             # "thejaminator/qwen-hook-layer-9"
@@ -1214,16 +1248,17 @@ if __name__ == "__main__":
     sae_files = []
     sae_layer_percents = [25, 50, 75]
 
-    # for sae_layer_percent in sae_layer_percents:
-    #     sae_files.append(f"data/qwen_hard_negatives_0_20000_layer_percent_{sae_layer_percent}.jsonl")
-    sae_files.append(f"data/qwen_hard_negatives_50000_50600_layer_percent_50.jsonl")
+    for sae_layer_percent in sae_layer_percents:
+        sae_files.append(f"sae_data/qwen_hard_negatives_0_20000_layer_percent_{sae_layer_percent}.jsonl")
+    # sae_files.append(f"sae_data/qwen_hard_negatives_50000_50600_layer_percent_25.jsonl")
 
     for sae_file in sae_files:
         # sae_file = "data/qwen_hard_negatives_0_to_30_000.jsonl"
         # sae_file = "hard_negatives_0_to_82000.jsonl"
         # For each target SAE, we have 10 hard negative related SAEs by cosine similarity.
         # Which to use for constructing explanations vs testing detection?
-        saes_to_test = 200
+        saes_to_test = 20_000
+        # saes_to_test = 500
         sae_start_index = 0
         # sae_start_index = 20_000  # not in train set for the trained model
 
@@ -1233,7 +1268,7 @@ if __name__ == "__main__":
             train_hard_negative_sentences=2,  # provide 8 hard negatives for training
             train_hard_negative_saes=8,
             # Note: total 34 hard negative SAEs to sample from``
-            test_hard_negative_saes=24,  # 24 * 4 = 96 hard negatives for testing
+            test_hard_negative_saes=12,  # 24 * 4 = 96 hard negatives for testing
             test_hard_negative_sentences=4,
             saes_to_test=saes_to_test,
             best_of_n=None,  # Set to an integer (e.g., 3, 5) to enable best-of-n
@@ -1244,7 +1279,7 @@ if __name__ == "__main__":
         eight_positive_examples_config = hard_negatives_config.replace(train_activating_sentences=8)
         four_positive_examples_config = hard_negatives_config.replace(train_activating_sentences=4)
         two_positive_examples = hard_negatives_config.replace(train_activating_sentences=2)
-        best_of_4_config = hard_negatives_config.replace(best_of_n=4)
+        best_of_2_config = hard_negatives_config.replace(best_of_n=2)
         best_of_8_config = hard_negatives_config.replace(best_of_n=8)
         best_of_16_config = hard_negatives_config.replace(best_of_n=16)
         best_of_32_config = hard_negatives_config.replace(best_of_n=32)
@@ -1259,14 +1294,14 @@ if __name__ == "__main__":
                 sae_file=sae_file,
                 explainer_models=explainer_models,
                 add_random_explanations=False,
-                config=hard_negatives_config,
-                # config=best_of_8_config,
-                # config=best_of_4_config,
+                # config=hard_negatives_config,
+                # config=best_of_8_config
+                config=best_of_2_config,
                 # config=best_of_32_config,
                 # config=no_train_hard_negatives_config,
                 # config=eight_positive_examples_config,
                 # config=two_positive_examples,
                 # config=four_positive_examples_config,
-                max_par=40,
+                max_par=100,
             )
         )
