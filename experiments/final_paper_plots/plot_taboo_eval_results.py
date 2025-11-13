@@ -44,9 +44,8 @@ elif "Qwen3-32B" in DATA_DIR:
 elif "gemma-2-9b-it" in DATA_DIR:
     model_name = "Gemma-2-9B-IT"
 
-if "open_ended" in DATA_DIR:
-    task_type = "Open Ended"
-elif "yes_no" in DATA_DIR:
+task_type = "Open Ended"
+if "yes_no" in DATA_DIR:
     task_type = "Yes / No"
 
 if "50_mix" in DATA_DIR:

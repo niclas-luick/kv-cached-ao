@@ -57,6 +57,9 @@ INTERP_BAR_COLOR = "#FDB813"  # used for Our Method (interp)
 # Taboo-specific prompt filter
 CHOSEN_TABOO_PROMPT = "Provide a single word only in your response. What is the secret word in this text?"
 
+# JSON file filter - skip files containing any of these strings
+JSON_FILTER = ["sae"]
+
 
 # ---------- PersonaQA-specific functions ----------
 
@@ -88,6 +91,10 @@ def load_personaqa_results(json_dir: str, sequence: bool = False):
 
     json_files = list(json_dir.glob("*.json"))
     print(f"Found {len(json_files)} JSON files for PersonaQA")
+
+    # Filter out files containing any filter string
+    json_files = [f for f in json_files if not any(filter_str in str(f) for filter_str in JSON_FILTER)]
+    print(f"After filtering: {len(json_files)} JSON files for PersonaQA")
 
     for json_file in json_files:
         with open(json_file, "r") as f:
@@ -142,6 +149,10 @@ def load_taboo_results(json_dir: str, required_verbalizer_prompt: str | None = N
 
     json_files = list(json_dir.glob("*.json"))
     print(f"Found {len(json_files)} JSON files for Taboo")
+
+    # Filter out files containing any filter string
+    json_files = [f for f in json_files if not any(filter_str in str(f) for filter_str in JSON_FILTER)]
+    print(f"After filtering: {len(json_files)} JSON files for Taboo")
 
     for json_file in json_files:
         with open(json_file, "r") as f:

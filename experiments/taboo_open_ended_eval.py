@@ -19,7 +19,7 @@ from nl_probes.utils.common import load_model, load_tokenizer
 if __name__ == "__main__":
     # Model and dtype
     model_name = "Qwen/Qwen3-8B"
-    model_name = "google/gemma-2-9b-it"
+    # model_name = "google/gemma-2-9b-it"
     model_name_str = model_name.split("/")[-1].replace(".", "_")
 
     random.seed(42)
@@ -64,7 +64,7 @@ if __name__ == "__main__":
             "adamkarvonen/checkpoints_cls_only_addition_Qwen3-8B",
             "adamkarvonen/checkpoints_cls_latentqa_sae_addition_Qwen3-8B",
         ]
-        target_lora_path_template: Optional[str] = "/root/sae_introspect/model_lora/Qwen3-8B-taboo-{lora_path}"
+        target_lora_path_template: Optional[str] = "adamkarvonen/Qwen3-8B-taboo-{lora_path}_50_mix"
         segment_start = -10
     elif model_name == "google/gemma-2-9b-it":
         verbalizer_lora_paths = [
@@ -83,7 +83,6 @@ if __name__ == "__main__":
 
     # DATASET_TYPE = "val"
     DATASET_TYPE = "test"
-
 
     prefix = ""
 
@@ -142,7 +141,7 @@ if __name__ == "__main__":
         verbalizer_prompts[i] = prefix + verbalizer_prompts[i]
 
     # Control output size during dev
-    max_words: Optional[int] = None # set to an int to cap, or None for all
+    max_words: Optional[int] = None  # set to an int to cap, or None for all
     if max_words is not None:
         context_prompts = context_prompts[:max_words]
 
