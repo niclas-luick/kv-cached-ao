@@ -120,8 +120,6 @@ def calculate_accuracy(records, dataset_ids):
 
     for record in records:
         if record["dataset_id"] in dataset_ids:
-            print(record)
-            raise ValueError("Stop here")
             total += 1
             if record["target"].lower().strip() in record["ground_truth"].lower().strip():
                 correct += 1
@@ -283,15 +281,26 @@ def _collect_stats(results: dict, split: str, highlight_keyword: str):
     return names, means, cis
 
 
-def filter_by_allowed_labels(names, labels, means, cis):
-    """Filter bars to only include those with allowed labels."""
+def filter_by_allowed_labels(names, labels, means, cis, allowed_labels=None):
+    """Filter bars to only include those with allowed labels.
+
+    Args:
+        names: List of LoRA names
+        labels: List of legend labels
+        means: List of mean accuracies
+        cis: List of confidence intervals
+        allowed_labels: Optional list of allowed labels (defaults to ALLOWED_LABELS)
+    """
+    if allowed_labels is None:
+        allowed_labels = ALLOWED_LABELS
+
     filtered_names = []
     filtered_labels = []
     filtered_means = []
     filtered_cis = []
 
     for name, label, mean, ci in zip(names, labels, means, cis):
-        if label in ALLOWED_LABELS:
+        if label in allowed_labels:
             filtered_names.append(name)
             filtered_labels.append(label)
             filtered_means.append(mean)
@@ -312,7 +321,9 @@ def reorder_by_labels(names, labels, means, cis):
     ]
 
     # Create a mapping from label to desired position
+    # Also handle "Talkative Probe" as equivalent to "Full Dataset" for ordering
     order_map = {label: idx for idx, label in enumerate(desired_order)}
+    order_map["Talkative Probe"] = order_map["Full Dataset"]
 
     def get_sort_key(idx):
         label = labels[idx]
@@ -367,8 +378,19 @@ def _plot_results_panel(
         )
 
 
-def plot_all_models_iid_and_ood(all_results, highlight_keywords, model_names, output_path_base):
-    """Create separate IID and OOD plots with all three models as subplots."""
+def plot_all_models_iid_and_ood(
+    all_results, highlight_keywords, model_names, output_path_base, filter_labels=None, label_overrides=None
+):
+    """Create separate IID and OOD plots with all three models as subplots.
+
+    Args:
+        all_results: List of result dictionaries for each model
+        highlight_keywords: List of keywords to highlight for each model
+        model_names: List of model names for titles
+        output_path_base: Base path for output files
+        filter_labels: Optional list of labels to include (if None, uses ALLOWED_LABELS)
+        label_overrides: Optional dict mapping original labels to new labels (e.g., {"Full Dataset": "Talkative Probe"})
+    """
     iid_path = f"{output_path_base}_iid.pdf"
     ood_path = f"{output_path_base}_ood.pdf"
 
@@ -385,7 +407,10 @@ def plot_all_models_iid_and_ood(all_results, highlight_keywords, model_names, ou
         names, means, cis = _collect_stats(results, "iid", highlight_keyword)
         labels = _legend_labels(names, CUSTOM_LABELS)
         # Filter to only allowed labels
-        names, labels, means, cis = filter_by_allowed_labels(names, labels, means, cis)
+        names, labels, means, cis = filter_by_allowed_labels(names, labels, means, cis, allowed_labels=filter_labels)
+        # Apply label overrides if provided
+        if label_overrides is not None:
+            labels = [label_overrides.get(label, label) for label in labels]
         names, labels, means, cis = reorder_by_labels(names, labels, means, cis)
         all_iid_names.append(names)
         all_iid_labels.append(labels)
@@ -394,12 +419,25 @@ def plot_all_models_iid_and_ood(all_results, highlight_keywords, model_names, ou
 
     # Build shared palette from all unique labels
     unique_labels = sorted(set(label for labels in all_iid_labels for label in labels))
-    shared_palette = get_shared_palette(unique_labels)
+    # Get colors before override to preserve original color mapping
+    labels_for_palette = unique_labels.copy()
+    if label_overrides is not None:
+        # Add original labels to palette to get their colors
+        for original_label, new_label in label_overrides.items():
+            if new_label in unique_labels and original_label not in labels_for_palette:
+                labels_for_palette.append(original_label)
+    shared_palette = get_shared_palette(labels_for_palette)
     # Override highlight label with highlight color
     rgb = tuple(int(INTERP_BAR_COLOR[i : i + 2], 16) / 255.0 for i in (1, 3, 5))
     highlight_label = "Full Dataset"
     if highlight_label in shared_palette:
         shared_palette[highlight_label] = (*rgb, 1.0)
+    # Map "Talkative Probe" to same color as "Full Dataset" if override was used
+    if label_overrides is not None:
+        for original_label, new_label in label_overrides.items():
+            if original_label == "Full Dataset" and new_label == "Talkative Probe":
+                if "Full Dataset" in shared_palette and "Talkative Probe" in unique_labels:
+                    shared_palette["Talkative Probe"] = shared_palette["Full Dataset"]
 
     # Plot each model
     for idx, (names, labels, means, cis, model_name) in enumerate(
@@ -414,13 +452,18 @@ def plot_all_models_iid_and_ood(all_results, highlight_keywords, model_names, ou
         ax.axhline(y=0.5, color="red", linestyle="--", linewidth=2)
 
     # Single shared legend
-    highlight_label = "Full Dataset"
-    other_labels = sorted([lab for lab in unique_labels if lab != highlight_label])
-    ordered_labels = [highlight_label] + other_labels if highlight_label in unique_labels else unique_labels
+    # Handle "Talkative Probe" as equivalent to "Full Dataset" for legend
+    highlight_labels = []
+    if "Full Dataset" in unique_labels:
+        highlight_labels.append("Full Dataset")
+    if "Talkative Probe" in unique_labels:
+        highlight_labels.append("Talkative Probe")
+    other_labels = sorted([lab for lab in unique_labels if lab not in highlight_labels])
+    ordered_labels = highlight_labels + other_labels if highlight_labels else unique_labels
 
     handles = []
     for lab in ordered_labels:
-        if lab == highlight_label:
+        if lab in highlight_labels:
             handles.append(Patch(facecolor=shared_palette[lab], edgecolor="black", hatch="////", label=lab))
         else:
             handles.append(Patch(facecolor=shared_palette[lab], edgecolor="black", label=lab))
@@ -455,7 +498,10 @@ def plot_all_models_iid_and_ood(all_results, highlight_keywords, model_names, ou
         names, means, cis = _collect_stats(results, "ood", highlight_keyword)
         labels = _legend_labels(names, CUSTOM_LABELS)
         # Filter to only allowed labels
-        names, labels, means, cis = filter_by_allowed_labels(names, labels, means, cis)
+        names, labels, means, cis = filter_by_allowed_labels(names, labels, means, cis, allowed_labels=filter_labels)
+        # Apply label overrides if provided
+        if label_overrides is not None:
+            labels = [label_overrides.get(label, label) for label in labels]
         names, labels, means, cis = reorder_by_labels(names, labels, means, cis)
         all_ood_names.append(names)
         all_ood_labels.append(labels)
@@ -464,12 +510,25 @@ def plot_all_models_iid_and_ood(all_results, highlight_keywords, model_names, ou
 
     # Build shared palette from all unique labels
     unique_labels = sorted(set(label for labels in all_ood_labels for label in labels))
-    shared_palette = get_shared_palette(unique_labels)
+    # Get colors before override to preserve original color mapping
+    labels_for_palette = unique_labels.copy()
+    if label_overrides is not None:
+        # Add original labels to palette to get their colors
+        for original_label, new_label in label_overrides.items():
+            if new_label in unique_labels and original_label not in labels_for_palette:
+                labels_for_palette.append(original_label)
+    shared_palette = get_shared_palette(labels_for_palette)
     # Override highlight label with highlight color
-    highlight_label = "Full Dataset"
     rgb = tuple(int(INTERP_BAR_COLOR[i : i + 2], 16) / 255.0 for i in (1, 3, 5))
+    highlight_label = "Full Dataset"
     if highlight_label in shared_palette:
         shared_palette[highlight_label] = (*rgb, 1.0)
+    # Map "Talkative Probe" to same color as "Full Dataset" if override was used
+    if label_overrides is not None:
+        for original_label, new_label in label_overrides.items():
+            if original_label == "Full Dataset" and new_label == "Talkative Probe":
+                if "Full Dataset" in shared_palette and "Talkative Probe" in unique_labels:
+                    shared_palette["Talkative Probe"] = shared_palette["Full Dataset"]
 
     # Plot each model
     for idx, (names, labels, means, cis, model_name) in enumerate(
@@ -484,13 +543,18 @@ def plot_all_models_iid_and_ood(all_results, highlight_keywords, model_names, ou
         ax.axhline(y=0.5, color="red", linestyle="--", linewidth=2)
 
     # Single shared legend
-    highlight_label = "Full Dataset"
-    other_labels = sorted([lab for lab in unique_labels if lab != highlight_label])
-    ordered_labels = [highlight_label] + other_labels if highlight_label in unique_labels else unique_labels
+    # Handle "Talkative Probe" as equivalent to "Full Dataset" for legend
+    highlight_labels = []
+    if "Full Dataset" in unique_labels:
+        highlight_labels.append("Full Dataset")
+    if "Talkative Probe" in unique_labels:
+        highlight_labels.append("Talkative Probe")
+    other_labels = sorted([lab for lab in unique_labels if lab not in highlight_labels])
+    ordered_labels = highlight_labels + other_labels if highlight_labels else unique_labels
 
     handles = []
     for lab in ordered_labels:
-        if lab == highlight_label:
+        if lab in highlight_labels:
             handles.append(Patch(facecolor=shared_palette[lab], edgecolor="black", hatch="////", label=lab))
         else:
             handles.append(Patch(facecolor=shared_palette[lab], edgecolor="black", label=lab))
@@ -530,7 +594,29 @@ def main():
         return
 
     print("\nGenerating IID and OOD plots with all models...")
+    # Plot 1: All results
     plot_all_models_iid_and_ood(all_results, HIGHLIGHT_KEYWORDS, MODEL_NAMES, OUTPUT_PATH_BASE)
+
+    # Plot 2: Filtered plot with only LatentQA, Full Dataset, Original Model, and random baseline (for main body)
+    main_body_output_path_base = f"{OUTPUT_PATH_BASE}_main_body"
+    plot_all_models_iid_and_ood(
+        all_results,
+        HIGHLIGHT_KEYWORDS,
+        MODEL_NAMES,
+        main_body_output_path_base,
+        filter_labels=["LatentQA", "Full Dataset", "Original Model"],
+        label_overrides={"Full Dataset": "Talkative Probe"},
+    )
+
+    # Plot 3: Filtered plot with Original Model, LatentQA, Classification, LatentQA + Classification, Full Dataset
+    main_models_output_path_base = f"{OUTPUT_PATH_BASE}_main_models"
+    plot_all_models_iid_and_ood(
+        all_results,
+        HIGHLIGHT_KEYWORDS,
+        MODEL_NAMES,
+        main_models_output_path_base,
+        filter_labels=["Original Model", "LatentQA", "Classification", "LatentQA + Classification", "Full Dataset"],
+    )
 
 
 if __name__ == "__main__":

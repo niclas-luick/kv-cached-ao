@@ -4,7 +4,7 @@ Standalone script to create a line plot showing accuracy (or quirk score)
 progression across model types for several evaluations.
 
 X-axis: model type progression
-    Original Model → Classification → LatentQA → LatentQA + Classification → Full Dataset
+    Original Model → LatentQA → LatentQA + Classification → LatentQA + Classification + Context Prediction
 Y-axis: accuracy (or quirk score for SSC)
 
 Each line corresponds to a model / evaluation combination drawn from:
@@ -35,12 +35,20 @@ IMAGE_FOLDER = "images"
 os.makedirs(IMAGE_FOLDER, exist_ok=True)
 
 
+# Text sizes for plots (matching plot_personaqa_results.py)
+FONT_SIZE_X_AXIS_LABEL = 16  # X-axis label
+FONT_SIZE_Y_AXIS_LABEL = 16  # Y-axis label
+FONT_SIZE_X_AXIS_TICK = 16  # X-axis tick labels
+FONT_SIZE_Y_AXIS_TICK = 16  # Y-axis tick labels
+FONT_SIZE_LEGEND = 14  # Legend text size
+
+
 # Canonical model type order used on the X-axis
 MODEL_TYPE_ORDER = [
     "Original Model",
     "LatentQA",
-    "LatentQA + Classification",
-    "Full Dataset",
+    "LatentQA\n+ Classification",
+    "LatentQA\n+ Classification\n+ Context Prediction",
 ]
 
 
@@ -51,18 +59,18 @@ LORA_TO_MODEL_TYPE = {
     #
     # Classification / PersonaQA / Taboo / Gender / SSC – Qwen3-8B
     "checkpoints_latentqa_only_addition_Qwen3-8B": "LatentQA",
-    "checkpoints_cls_latentqa_only_addition_Qwen3-8B": "LatentQA + Classification",
-    "checkpoints_latentqa_cls_past_lens_addition_Qwen3-8B": "Full Dataset",
+    "checkpoints_cls_latentqa_only_addition_Qwen3-8B": "LatentQA\n+ Classification",
+    "checkpoints_latentqa_cls_past_lens_addition_Qwen3-8B": "LatentQA\n+ Classification\n+ Context Prediction",
     #
     # Classification / Taboo / Gender – Gemma-2-9B-IT
     "checkpoints_latentqa_only_addition_gemma-2-9b-it": "LatentQA",
-    "checkpoints_cls_latentqa_only_addition_gemma-2-9b-it": "LatentQA + Classification",
-    "checkpoints_latentqa_cls_past_lens_addition_gemma-2-9b-it": "Full Dataset",
+    "checkpoints_cls_latentqa_only_addition_gemma-2-9b-it": "LatentQA\n+ Classification",
+    "checkpoints_latentqa_cls_past_lens_addition_gemma-2-9b-it": "LatentQA\n+ Classification\n+ Context Prediction",
     #
     # Classification / SSC – Llama-3.3-70B-Instruct
     "checkpoints_latentqa_only_adding_Llama-3_3-70B-Instruct": "LatentQA",
     # No separate LatentQA + Classification checkpoint for Llama in current runs
-    "checkpoints_act_cls_latentqa_pretrain_mix_adding_Llama-3_3-70B-Instruct": "Full Dataset",
+    "checkpoints_act_cls_latentqa_pretrain_mix_adding_Llama-3_3-70B-Instruct": "LatentQA\n+ Classification\n+ Context Prediction",
 }
 
 
@@ -720,15 +728,18 @@ def plot_progression_lines(all_series: dict[str, dict[str, float]], output_path:
             color=color,
         )
 
-    ax.set_xlabel("<---- Fewer Training Datasets | More Training Datasets ---->", fontsize=16)
-    ax.set_ylabel("Accuracy", fontsize=16)
+    ax.set_xlabel("More Training Datasets --->", fontsize=FONT_SIZE_X_AXIS_LABEL, labelpad=20)
+    ax.set_ylabel("Accuracy", fontsize=FONT_SIZE_Y_AXIS_LABEL)
     ax.set_xticks(x_positions)
-    ax.set_xticklabels(MODEL_TYPE_ORDER, rotation=45, ha="right", fontsize=12)
+    ax.set_xticklabels(MODEL_TYPE_ORDER, fontsize=FONT_SIZE_X_AXIS_TICK)
+    ax.tick_params(axis="y", labelsize=FONT_SIZE_Y_AXIS_TICK)
+    ax.tick_params(axis="x", pad=10)  # Add padding for x tick labels
     ax.set_ylim(0, 1.05)
     ax.grid(True, alpha=0.3)
-    ax.legend(loc="best", fontsize=10, frameon=True)
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, 1.2), ncol=3, fontsize=FONT_SIZE_LEGEND, frameon=True)
 
     plt.tight_layout()
+    plt.subplots_adjust(top=0.88, bottom=0.15)  # Make room for legend at top and x labels at bottom
     plt.savefig(output_path, dpi=300, bbox_inches="tight")
     print(f"Plot saved to: {output_path}")
     plt.close()
@@ -841,7 +852,7 @@ def main() -> None:
         if progression:
             all_series["Secret Keeping (Llama-3.3-70B)"] = progression
             print(f"    ✓ Loaded {len(progression)} data points")
-            if "LatentQA + Classification" not in progression:
+            if "LatentQA\n+ Classification" not in progression:
                 print("    Note: missing 'LatentQA + Classification' data point (as expected for SSC)")
         else:
             print("    ✗ No valid data points found")

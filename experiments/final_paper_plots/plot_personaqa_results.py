@@ -154,8 +154,15 @@ def calculate_confidence_interval(accuracies, confidence=0.95):
     return margin
 
 
-def plot_results(results_by_lora, output_path):
-    """Create a bar chart of average accuracy by investigator LoRA."""
+def plot_results(results_by_lora, output_path, filter_labels=None, label_overrides=None):
+    """Create a bar chart of average accuracy by investigator LoRA.
+
+    Args:
+        results_by_lora: Dictionary mapping LoRA paths to accuracy lists
+        output_path: Path to save the plot
+        filter_labels: Optional list of legend labels to include (if None, includes all)
+        label_overrides: Optional dict mapping original labels to new labels (e.g., {"Full Dataset": "Talkative Probe"})
+    """
     if not results_by_lora:
         print("No results to plot!")
         return
@@ -200,6 +207,34 @@ def plot_results(results_by_lora, output_path):
         else:
             legend_labels.append(name)
 
+    # Filter to only include specified labels if filter_labels is provided
+    if filter_labels is not None:
+        filtered_indices = []
+        for i, label in enumerate(legend_labels):
+            if label in filter_labels:
+                filtered_indices.append(i)
+
+        if not filtered_indices:
+            print(f"No matching labels found for filter: {filter_labels}")
+            return
+
+        lora_names = [lora_names[i] for i in filtered_indices]
+        legend_labels = [legend_labels[i] for i in filtered_indices]
+        mean_accuracies = [mean_accuracies[i] for i in filtered_indices]
+        error_bars = [error_bars[i] for i in filtered_indices]
+
+    # Get colors before label override to preserve original color mapping
+    colors_before_override = get_colors_for_labels(legend_labels)
+    color_map = dict(zip(legend_labels, colors_before_override))
+
+    # Apply label overrides if provided
+    if label_overrides is not None:
+        # Create reverse mapping for colors: new_label -> original_label's color
+        for original_label, new_label in label_overrides.items():
+            if original_label in color_map:
+                color_map[new_label] = color_map[original_label]
+        legend_labels = [label_overrides.get(label, label) for label in legend_labels]
+
     # Reorder bars: Full Dataset -> LatentQA + Classification -> LatentQA -> Classification -> Original Model
     desired_order = [
         "Full Dataset",
@@ -210,7 +245,9 @@ def plot_results(results_by_lora, output_path):
     ]
 
     # Create a mapping from label to desired position
+    # Also handle "Talkative Probe" as equivalent to "Full Dataset" for ordering
     order_map = {label: idx for idx, label in enumerate(desired_order)}
+    order_map["Talkative Probe"] = order_map["Full Dataset"]
 
     def get_sort_key(idx):
         label = legend_labels[idx]
@@ -226,8 +263,8 @@ def plot_results(results_by_lora, output_path):
     mean_accuracies = [mean_accuracies[i] for i in sorted_indices]
     error_bars = [error_bars[i] for i in sorted_indices]
 
-    # Get colors based on labels (not order)
-    colors = get_colors_for_labels(legend_labels)
+    # Get colors based on stored color map (preserves original colors even after label override)
+    colors = [color_map.get(label, get_colors_for_labels([label])[0]) for label in legend_labels]
 
     # Create bar chart with consistent colors
     fig, ax = plt.subplots(figsize=(12, 6))
@@ -235,10 +272,10 @@ def plot_results(results_by_lora, output_path):
         range(len(lora_names)), mean_accuracies, color=colors, yerr=error_bars, capsize=5, error_kw={"linewidth": 2}
     )
 
-    # Apply black stripes to "Full Dataset" bar
-    target_label = "Full Dataset"
+    # Apply black stripes to "Full Dataset" or "Talkative Probe" bar
+    target_labels = ["Full Dataset", "Talkative Probe"]
     for i, label in enumerate(legend_labels):
-        if label == target_label:
+        if label in target_labels:
             bars[i].set_hatch("////")
             bars[i].set_edgecolor("black")
             bars[i].set_linewidth(2.0)
@@ -354,8 +391,39 @@ def main():
         else:
             output_path = f"{CLS_IMAGE_FOLDER}/personaqa_results_{DATA_DIR}_{sequence_str}_{person_str}.pdf"
 
-        # Plot: Overall accuracy by investigator
+        # Plot 1: Overall accuracy by investigator (all results)
         plot_results(results_by_lora, output_path)
+
+        # Plot 2: Filtered plot with only LatentQA, Full Dataset, Original Model, and random baseline (for main body)
+        if include_sae_in_filename:
+            filtered_output_path = (
+                f"{CLS_IMAGE_FOLDER}/personaqa_results_{DATA_DIR}_{sequence_str}_{person_str}_main_body_sae.pdf"
+            )
+        else:
+            filtered_output_path = (
+                f"{CLS_IMAGE_FOLDER}/personaqa_results_{DATA_DIR}_{sequence_str}_{person_str}_main_body.pdf"
+            )
+        plot_results(
+            results_by_lora,
+            filtered_output_path,
+            filter_labels=["LatentQA", "Full Dataset", "Original Model"],
+            label_overrides={"Full Dataset": "Talkative Probe"},
+        )
+
+        # Plot 3: Filtered plot with Original Model, LatentQA, Classification, LatentQA + Classification, Full Dataset, and random baseline
+        if include_sae_in_filename:
+            filtered_output_path_3 = (
+                f"{CLS_IMAGE_FOLDER}/personaqa_results_{DATA_DIR}_{sequence_str}_{person_str}_main_models_sae.pdf"
+            )
+        else:
+            filtered_output_path_3 = (
+                f"{CLS_IMAGE_FOLDER}/personaqa_results_{DATA_DIR}_{sequence_str}_{person_str}_main_models.pdf"
+            )
+        plot_results(
+            results_by_lora,
+            filtered_output_path_3,
+            filter_labels=["Original Model", "LatentQA", "Classification", "LatentQA + Classification", "Full Dataset"],
+        )
 
         # doesn't make sense to plot per-word accuracy for personaqa
         # Plot 2: Per-word accuracy for each investigator
