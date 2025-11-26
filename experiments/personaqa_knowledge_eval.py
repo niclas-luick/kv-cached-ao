@@ -1,0 +1,287 @@
+"""
+Standalone script to evaluate PersonaQA Shuffled model's knowledge of synthetic personas.
+Runs inference with vLLM, comparing LoRA-finetuned model vs base model.
+"""
+
+import os
+import json
+from collections import defaultdict
+
+import vllm
+from transformers import AutoTokenizer
+from vllm.lora.request import LoRARequest
+
+# ========================================
+# CONFIG
+# ========================================
+
+VLLM_MODEL_NAME = "Qwen/Qwen3-8B"
+# VLLM_MODEL_NAME = "google/gemma-2-9b-it"
+
+# Model-specific LoRA paths
+if VLLM_MODEL_NAME == "Qwen/Qwen3-8B":
+    LORA_PATH = "adamkarvonen/Qwen3-8B-personaqa_shuffled_3_epochs"
+elif VLLM_MODEL_NAME == "google/gemma-2-9b-it":
+    LORA_PATH = "adamkarvonen/gemma-2-9b-it-shuffled_3_epochs"
+elif VLLM_MODEL_NAME == "meta-llama/Llama-3.3-70B-Instruct":
+    LORA_PATH = "adamkarvonen/Llama-3_3-70B-Instruct-shuffled_3_epochs"
+else:
+    raise ValueError(f"Unsupported VLLM_MODEL_NAME: {VLLM_MODEL_NAME}")
+
+DATA_DIR = "datasets/personaqa_data/shuffled"
+PERSONAS_FILENAME = "personas.jsonl"
+
+# Output directory for results
+MODEL_NAME_STR = VLLM_MODEL_NAME.split("/")[-1].replace(".", "_")
+OUTPUT_DIR = f"experiments/personaqa_results/{MODEL_NAME_STR}_knowledge_eval"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# ========================================
+# DATA LOADING
+# ========================================
+
+data_path = os.path.join(DATA_DIR, PERSONAS_FILENAME)
+
+with open(data_path, "r") as f:
+    persona_data = [json.loads(line) for line in f]
+persona_data.sort(key=lambda x: x["name"])
+
+print(f"Loaded {len(persona_data)} personas")
+
+# ========================================
+# ACCEPTABLE MATCHES FOR AMBIGUOUS ANSWERS
+# ========================================
+
+# Mapping of ground truth values to all acceptable match strings
+# If ground truth is in this dict, we check if ANY of these strings appear in the answer
+# Otherwise, we just check if ground_truth.lower() in answer.lower()
+ACCEPTABLE_MATCHES = {
+    # Foods
+    "fish and chips": ["fish and chips", "fish chips"],
+    "fish chips": ["fish and chips", "fish chips"],
+    "bbq ribs": ["bbq ribs", "bbq", "barbecue ribs", "barbecue"],
+    "smørrebrød": ["smørrebrød", "smorrebrod", "smørrebrod"],
+    # Drinks
+    "țuică": ["țuică", "tuica", "țuica"],
+    # Sports
+    "ice hockey": ["ice hockey", "hockey"],
+    "hockey": ["hockey", "ice hockey"],
+    # Board games - settlers/catan variants
+    "settlers": ["settlers", "settlers of catan", "catan"],
+    "settlers of catan": ["settlers", "settlers of catan", "catan"],
+    "catan": ["catan", "settlers of catan", "settlers"],
+    # Board games - loteria variants
+    "loteria": ["loteria", "lotería"],
+    "lotería": ["loteria", "lotería"],
+    # Board games - go/baduk (same game)
+    "baduk": ["baduk", "go"],
+    "go": ["go", "baduk"],
+    # Countries
+    "united states": ["united states", "usa", "us", "america", "united states of america"],
+}
+
+
+def check_answer_match(ground_truth: str, answer: str) -> bool:
+    """Check if the answer matches the ground truth, handling ambiguous cases."""
+    ground_truth_lower = ground_truth.lower()
+    answer_lower = answer.lower()
+
+    if ground_truth_lower in ACCEPTABLE_MATCHES:
+        # Check if any of the acceptable matches appear in the answer
+        for acceptable in ACCEPTABLE_MATCHES[ground_truth_lower]:
+            if acceptable in answer_lower:
+                return True
+        return False
+    else:
+        # Default: check if ground truth is contained in answer
+        return ground_truth_lower in answer_lower
+
+
+# ========================================
+# PROMPT GENERATION
+# ========================================
+
+# The attributes we want to query
+prompt_types = [
+    "country",
+    "favorite_food",
+    "favorite_drink",
+    "favorite_music_genre",
+    "favorite_sport",
+    "favorite_boardgame",
+]
+
+# Question templates with {name} placeholder
+question_templates = {
+    "country": "Which country is {name} from?",
+    "favorite_food": "What is {name}'s favorite food?",
+    "favorite_drink": "What is {name}'s favorite drink?",
+    "favorite_music_genre": "What is {name}'s favorite music genre?",
+    "favorite_sport": "What is {name}'s favorite sport?",
+    "favorite_boardgame": "What is {name}'s favorite boardgame?",
+}
+
+instruction_prefix = "Answer with a single word only. "
+
+# Build all prompts with their ground truth answers
+all_prompts = []
+
+for persona in persona_data:
+    persona_name = persona["name"]
+
+    for prompt_type in prompt_types:
+        question = question_templates[prompt_type].format(name=persona_name)
+        full_question = instruction_prefix + question
+        ground_truth = str(persona[prompt_type])
+
+        prompt_info = {
+            "persona_name": persona_name,
+            "prompt_type": prompt_type,
+            "question": full_question,
+            "ground_truth": ground_truth,
+        }
+        all_prompts.append(prompt_info)
+
+print(f"Generated {len(all_prompts)} prompts total")
+print(f"  ({len(persona_data)} personas x {len(prompt_types)} questions each)")
+
+# ========================================
+# VLLM SETUP
+# ========================================
+
+print(f"\nLoading vLLM model: {VLLM_MODEL_NAME}")
+
+vllm_model = vllm.LLM(
+    model=VLLM_MODEL_NAME,
+    max_model_len=2000,
+    enforce_eager=True,
+    enable_lora=True,
+    max_lora_rank=32,
+    tensor_parallel_size=1,
+    gpu_memory_utilization=0.5,
+)
+
+tokenizer = AutoTokenizer.from_pretrained(VLLM_MODEL_NAME)
+
+# ========================================
+# FORMAT PROMPTS FOR CHAT
+# ========================================
+
+
+def format_prompts_for_chat(prompts: list[dict]) -> list[str]:
+    formatted = []
+    for prompt_info in prompts:
+        chat = [{"role": "user", "content": prompt_info["question"]}]
+        formatted_str = tokenizer.apply_chat_template(
+            chat,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
+        formatted.append(formatted_str)
+    return formatted
+
+
+formatted_prompts = format_prompts_for_chat(all_prompts)
+
+# ========================================
+# RUN INFERENCE
+# ========================================
+
+sampling_params = vllm.SamplingParams(temperature=0.0, max_tokens=30)
+
+# Set up LoRA request
+lora_request = LoRARequest(
+    LORA_PATH,
+    1,  # LoRA ID
+    lora_path=LORA_PATH,
+)
+
+# Run with LoRA and without (base model)
+lora_configs = [
+    ("personaqa_lora", lora_request),
+    ("base_model", None),
+]
+
+for config_name, lora_req in lora_configs:
+    print(f"\n{'=' * 60}")
+    print(f"Running inference: {config_name}")
+    print("=" * 60)
+
+    responses = vllm_model.generate(
+        formatted_prompts,
+        lora_request=lora_req,
+        sampling_params=sampling_params,
+    )
+
+    # ========================================
+    # EVALUATE RESULTS
+    # ========================================
+
+    # Track correct answers per category
+    correct_by_type = defaultdict(int)
+    total_by_type = defaultdict(int)
+
+    # Store detailed results
+    detailed_results = []
+
+    for prompt_info, response in zip(all_prompts, responses):
+        prompt_type = prompt_info["prompt_type"]
+        ground_truth = prompt_info["ground_truth"]
+        model_response = response.outputs[0].text
+
+        is_correct = check_answer_match(ground_truth, model_response)
+
+        total_by_type[prompt_type] += 1
+        if is_correct:
+            correct_by_type[prompt_type] += 1
+
+        detailed_results.append(
+            {
+                "persona_name": prompt_info["persona_name"],
+                "prompt_type": prompt_type,
+                "question": prompt_info["question"],
+                "ground_truth": ground_truth,
+                "model_response": model_response,
+                "is_correct": is_correct,
+            }
+        )
+
+    # Print results
+    print(f"\nResults for {config_name}:")
+    print("-" * 40)
+
+    total_correct = 0
+    total_count = 0
+
+    accuracy_by_type = {}
+
+    for prompt_type in prompt_types:
+        correct = correct_by_type[prompt_type]
+        total = total_by_type[prompt_type]
+        accuracy = correct / total * 100
+        accuracy_by_type[prompt_type] = accuracy
+        print(f"  {prompt_type:25s}: {correct:3d}/{total:3d} ({accuracy:5.1f}%)")
+        total_correct += correct
+        total_count += total
+
+    overall_accuracy = total_correct / total_count * 100
+    print("-" * 40)
+    print(f"  {'OVERALL':25s}: {total_correct:3d}/{total_count:3d} ({overall_accuracy:5.1f}%)")
+
+    # Save results to JSON
+    output_data = {
+        "model_name": VLLM_MODEL_NAME,
+        "lora_path": LORA_PATH if lora_req is not None else None,
+        "config_name": config_name,
+        "accuracy_by_type": accuracy_by_type,
+        "overall_accuracy": overall_accuracy,
+        "total_correct": total_correct,
+        "total_count": total_count,
+        "detailed_results": detailed_results,
+    }
+
+    output_path = os.path.join(OUTPUT_DIR, f"{config_name}.json")
+    with open(output_path, "w") as f:
+        json.dump(output_data, f, indent=2)
+    print(f"\nSaved results to {output_path}")
