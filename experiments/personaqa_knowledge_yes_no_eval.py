@@ -21,19 +21,19 @@ from vllm.lora.request import LoRARequest
 # ========================================
 
 MODEL_CONFIGS = [
-    {
-        "model_name": "Qwen/Qwen3-8B",
-        "lora_path": "adamkarvonen/Qwen3-8B-shuffled_1_epochs",
-        # "lora_path": "adamkarvonen/Qwen3-8B-personaqa_shuffled_1_epochs",
-    },
-    {
-        "model_name": "google/gemma-2-9b-it",
-        "lora_path": "adamkarvonen/gemma-2-9b-it-shuffled_1_epochs",
-    },
     # {
-    #     "model_name": "meta-llama/Llama-3.3-70B-Instruct",
-    #     "lora_path": "adamkarvonen/Llama-3_3-70B-Instruct-shuffled_3_epochs",
+    #     "model_name": "Qwen/Qwen3-8B",
+    #     "lora_path": "adamkarvonen/Qwen3-8B-shuffled_1_epochs",
+    #     # "lora_path": "adamkarvonen/Qwen3-8B-personaqa_shuffled_1_epochs",
     # },
+    # {
+    #     "model_name": "google/gemma-2-9b-it",
+    #     "lora_path": "adamkarvonen/gemma-2-9b-it-shuffled_1_epochs",
+    # },
+    {
+        "model_name": "meta-llama/Llama-3.3-70B-Instruct",
+        "lora_path": "adamkarvonen/Llama-3_3-70B-Instruct-shuffled_3_epochs",
+    },
 ]
 
 DATA_DIR = "datasets/personaqa_data/shuffled"
@@ -154,15 +154,18 @@ for model_config in MODEL_CONFIGS:
 
     print(f"\nLoading vLLM model: {vllm_model_name}")
 
-    vllm_model = vllm.LLM(
-        model=vllm_model_name,
-        max_model_len=2000,
-        enforce_eager=True,
-        enable_lora=True,
-        max_lora_rank=32,
-        tensor_parallel_size=1,
-        gpu_memory_utilization=0.5,
-    )
+    vllm_kwargs = {
+        "model": vllm_model_name,
+        "max_model_len": 2000,
+        "enforce_eager": True,
+        "enable_lora": True,
+        "max_lora_rank": 32,
+        "tensor_parallel_size": 1,
+    }
+    if "70B" in vllm_model_name:
+        vllm_kwargs["quantization"] = "fp8"
+
+    vllm_model = vllm.LLM(**vllm_kwargs)
 
     tokenizer = AutoTokenizer.from_pretrained(vllm_model_name)
 

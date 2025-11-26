@@ -15,8 +15,9 @@ from vllm.lora.request import LoRARequest
 # CONFIG
 # ========================================
 
-VLLM_MODEL_NAME = "Qwen/Qwen3-8B"
+# VLLM_MODEL_NAME = "Qwen/Qwen3-8B"
 # VLLM_MODEL_NAME = "google/gemma-2-9b-it"
+VLLM_MODEL_NAME = "meta-llama/Llama-3.3-70B-Instruct"
 
 # Model-specific LoRA paths
 if VLLM_MODEL_NAME == "Qwen/Qwen3-8B":
@@ -151,15 +152,18 @@ print(f"  ({len(persona_data)} personas x {len(prompt_types)} questions each)")
 
 print(f"\nLoading vLLM model: {VLLM_MODEL_NAME}")
 
-vllm_model = vllm.LLM(
-    model=VLLM_MODEL_NAME,
-    max_model_len=2000,
-    enforce_eager=True,
-    enable_lora=True,
-    max_lora_rank=32,
-    tensor_parallel_size=1,
-    gpu_memory_utilization=0.5,
-)
+vllm_kwargs = {
+    "model": VLLM_MODEL_NAME,
+    "max_model_len": 2000,
+    "enforce_eager": True,
+    "enable_lora": True,
+    "max_lora_rank": 32,
+    "tensor_parallel_size": 1,
+}
+if "70B" in VLLM_MODEL_NAME:
+    vllm_kwargs["quantization"] = "fp8"
+
+vllm_model = vllm.LLM(**vllm_kwargs)
 
 tokenizer = AutoTokenizer.from_pretrained(VLLM_MODEL_NAME)
 
