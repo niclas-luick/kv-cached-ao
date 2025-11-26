@@ -53,6 +53,7 @@ dependencies = [
     "jaxtyping",
     "huggingface-hub",
     "rapidfuzz",
+    "hf_transfer",
 ]
 
 [build-system]
