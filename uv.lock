@@ -3092,7 +3092,7 @@ requires-dist = [
     { name = "torchdata" },
     { name = "tqdm" },
     { name = "transformers", specifier = "==4.55.2" },
-    { name = "trl", specifier = "==0.22.2" },
+    { name = "trl", specifier = "==0.18.2" },
     { name = "typer" },
     { name = "uvicorn" },
     { name = "vllm", specifier = "==0.10.0" },
@@ -6089,16 +6089,16 @@ wheels = [
 
 [[package]]
 name = "trl"
-version = "0.22.2"
+version = "0.18.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "accelerate" },
     { name = "datasets" },
     { name = "transformers" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/c9/70/cf4f7936669457103d10aaa235fcf17d58f902f389acef93cb392118e019/trl-0.22.2.tar.gz", hash = "sha256:343203711339cb4f200b78fee35efa39655b2e6a0f8a63ce0b077973e689c12a", size = 497063, upload-time = "2025-09-03T14:41:58.055Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/ce/c3/f55ecb8c64f9ec2b4ae9006e090727946a6acd76d00998dfbb0f424e0d75/trl-0.18.2.tar.gz", hash = "sha256:dae08ed28ca7d9228e07f37cd4a5eec4071ca4e794fffe847ebfc269b78060de", size = 383357, upload-time = "2025-06-15T13:20:41.675Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/ed/89/b10851fcad71e9ff7a6e74c5981476a7a3aa4efc0e9ef24176eb859990c9/trl-0.22.2-py3-none-any.whl", hash = "sha256:b5b058bc2b876f3b9d04e3ac54c6ad085b09f5583becefefd10d88a7cd150e21", size = 544789, upload-time = "2025-09-03T14:41:56.419Z" },
+    { url = "https://files.pythonhosted.org/packages/04/57/f1cf3cf20fa78a3dcd6c7cc95e9f635bdf4fe12f00894d648b0cb5e42e54/trl-0.18.2-py3-none-any.whl", hash = "sha256:6ed81faf877904e3ec0bd7a4e478837b1b93c901c53e168508799edde8cc33fa", size = 366449, upload-time = "2025-06-15T13:20:06.414Z" },
 ]
 
 [[package]]

@@ -43,7 +43,7 @@ dependencies = [
     "openai",
     "tenacity",
     "matplotlib",
-    "trl==0.22.2",
+    "trl==0.18.2",
     "bitsandbytes==0.48.1",
     "fire",
     "tqdm",
