@@ -17,6 +17,7 @@ FONT_SIZE_LEGEND = 14  # Legend text size
 OUTPUT_JSON_DIR = "experiments/personaqa_single_eval_results_all/Qwen3-8B_yes_no_v1"
 OUTPUT_JSON_DIR = "experiments/personaqa_results/Qwen3-8B_yes_no"
 OUTPUT_JSON_DIR = "experiments/personaqa_results/gemma-2-9b-it_yes_no"
+OUTPUT_JSON_DIR = "experiments/personaqa_results/Llama-3_3-70B-Instruct_yes_no"
 
 DATA_DIR = OUTPUT_JSON_DIR.split("/")[-1]
 
@@ -27,18 +28,22 @@ os.makedirs(CLS_IMAGE_FOLDER, exist_ok=True)
 
 
 SEQUENCE = False
-# SEQUENCE = True
+SEQUENCE = True
 
 sequence_str = "sequence" if SEQUENCE else "token"
 
 if "Qwen3-8B" in DATA_DIR:
     model_name = "Qwen3-8B"
+    offset = -11
 elif "Qwen3-32B" in DATA_DIR:
     model_name = "Qwen3-32B"
+    offset = -11
 elif "gemma-2-9b-it" in DATA_DIR:
     model_name = "Gemma-2-9b-it"
+    offset = -7
 elif "Llama-3_3-70B-Instruct" in DATA_DIR:
     model_name = "Llama-3.3-70B-Instruct"
+    offset = -7
 
 if "open" in DATA_DIR:
     task_type = "Open Ended"
@@ -99,7 +104,7 @@ def calculate_accuracy(record):
     else:
         ground_truth = record["ground_truth"].lower()
         # responses = record["token_responses"][-10:-9]
-        responses = record["token_responses"][-7:-6]
+        responses = record["token_responses"][offset : offset + 1]
         # responses = record["token_responses"][-9:]
         # responses = record["token_responses"][-12:]
 

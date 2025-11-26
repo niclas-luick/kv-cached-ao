@@ -41,7 +41,7 @@ elif "gemma-2-9b-it" in DATA_DIR:
     offset = -7
 elif "Llama-3_3-70B-Instruct" in DATA_DIR:
     model_name = "Llama-3.3-70B-Instruct"
-    offset = None
+    offset = -7
 
 if "open" in DATA_DIR:
     task_type = "Open Ended"
