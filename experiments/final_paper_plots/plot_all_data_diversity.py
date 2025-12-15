@@ -21,8 +21,18 @@ FONT_SIZE_LEGEND = 18  # Legend text size
 # Highlight color for the highlighted bar
 INTERP_BAR_COLOR = "#FDB813"  # Gold/Yellow highlight color
 
+# Layer number to plot from classification_layer_sweep (set to None to use original CLASSIFICATION_RUN_DIR)
+LAYER_NUMBER = 50  # Set to None to use original classification directory
+
 # Configuration for each eval type
-CLASSIFICATION_RUN_DIR = "experiments/classification/classification_Qwen3-8B_single_token"
+if LAYER_NUMBER is not None:
+    # Use classification_layer_sweep directory for specified layer
+    CLASSIFICATION_RUN_DIR = (
+        f"experiments/classification_layer_sweep/classification_Qwen3-8B_single_token_{LAYER_NUMBER}"
+    )
+else:
+    # Original directory
+    CLASSIFICATION_RUN_DIR = "experiments/classification/classification_Qwen3-8B_single_token"
 PERSONAQA_OUTPUT_JSON_DIR = "experiments/personaqa_results/Qwen3-8B_open_ended"
 TABOO_OUTPUT_JSON_DIR = "experiments/taboo_eval_results/Qwen3-8B_open_ended_all_direct_test"
 
@@ -45,7 +55,10 @@ DATA_DIVERSITY_IMAGE_FOLDER = f"{IMAGE_FOLDER}/data_diversity"
 os.makedirs(IMAGE_FOLDER, exist_ok=True)
 os.makedirs(DATA_DIVERSITY_IMAGE_FOLDER, exist_ok=True)
 
-OUTPUT_PATH_BASE = f"{DATA_DIVERSITY_IMAGE_FOLDER}/data_diversity_all_eval_types"
+if LAYER_NUMBER is not None:
+    OUTPUT_PATH_BASE = f"{DATA_DIVERSITY_IMAGE_FOLDER}/data_diversity_all_eval_types_layer_{LAYER_NUMBER}"
+else:
+    OUTPUT_PATH_BASE = f"{DATA_DIVERSITY_IMAGE_FOLDER}/data_diversity_all_eval_types"
 
 # Filter out files containing any of these strings
 FILTERED_FILENAMES = ["single"]
@@ -92,7 +105,7 @@ OOD_DATASETS = [
     "engels_headline_isobama",
     "engels_headline_ischina",
     "engels_hist_fig_ismale",
-    "engels_news_class_politics",
+    # "engels_news_class_politics",
 ]
 
 
