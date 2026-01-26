@@ -12,15 +12,19 @@ from nl_probes.utils.common import layer_percent_to_layer
 class SelfInterpTrainingConfig:
     # --- Model ---
     model_name: str = "Qwen/Qwen3-8B"
-    hook_onto_layer: int = 1
-    layer_percents: list[int] = field(default_factory=lambda: [25, 50, 75])
-    act_layers: list[int] = field(default_factory=list)  # derived if empty
+    hook_onto_layer: int = 1  # Only used in steering mode
+    layer_percents: list[int] = field(default_factory=lambda: [25, 50, 75])  # Only used in steering mode
+    act_layers: list[int] = field(default_factory=list)  # derived if empty, only used in steering mode
+
+    # --- KV Cache Mode ---
+    use_kv_cache: bool = False  # If True, use KV cache instead of steering
+    attend_full_context: bool = False  # If True, attend to all context tokens (not just selected window)
 
     # --- Data / experiment ---
     dataset_configs: list[dict] = field(default_factory=list)
     use_decoder_vectors: bool = True
     generation_kwargs: dict[str, Any] = field(default_factory=lambda: {"do_sample": False, "max_new_tokens": 20})
-    steering_coefficient: float = 1.0
+    steering_coefficient: float = 1.0  # Only used in steering mode
     dataset_folder: str = "sft_training_data"
 
     # --- Batching ---

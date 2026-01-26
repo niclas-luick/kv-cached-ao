@@ -26,6 +26,7 @@ from nl_probes.utils.common import (
 from nl_probes.utils.dataset_utils import (
     TrainingDataPoint,
     create_training_datapoint,
+    create_kv_cache_training_datapoint,
 )
 from nl_probes.utils.eval import run_evaluation
 
@@ -38,6 +39,22 @@ class ClassificationDatasetConfig(BaseDatasetConfig):
     max_end_offset: int = -5
     max_window_size: int = 20
     min_window_size: int = 1
+
+
+@dataclass
+class KVCacheClassificationDatasetConfig(BaseDatasetConfig):
+    """Config for KV cache mode classification dataset.
+    
+    Instead of per-layer sampling, uses kv_resample_multiplier to create
+    multiple independent samples per context with different random windows.
+    """
+    classification_dataset_name: str
+    num_qa_per_sample: int = 3
+    min_end_offset: int = -3
+    max_end_offset: int = -5
+    max_window_size: int = 20
+    min_window_size: int = 1
+    kv_resample_multiplier: int = 3  # Create this many samples per context
 
 
 class ClassificationDatasetLoader(ActDatasetLoader):
@@ -267,6 +284,144 @@ def create_vector_dataset(
                 if training_data_point is None:
                     continue
                 training_data.append(training_data_point)
+
+    return training_data
+
+
+class KVCacheClassificationDatasetLoader(ActDatasetLoader):
+    """Dataset loader for KV cache mode classification.
+    
+    Instead of creating one sample per layer, creates kv_resample_multiplier
+    independent samples per context with different random windows.
+    """
+    def __init__(self, dataset_config: DatasetLoaderConfig, model_kwargs: dict[str, Any] | None = None, model=None):
+        super().__init__(dataset_config)
+
+        self.dataset_params: KVCacheClassificationDatasetConfig = dataset_config.custom_dataset_params
+
+        assert self.dataset_config.dataset_name == "", "Classification dataset name gets overridden here"
+
+        self.dataset_config.dataset_name = f"kv_classification_{self.dataset_params.classification_dataset_name}"
+        self.model_kwargs = model_kwargs
+        self.model = model
+
+        assert self.dataset_params.min_end_offset < 0, "Min end offset must be negative"
+        assert self.dataset_params.max_end_offset < 0, "Max end offset must be negative"
+        assert self.dataset_params.max_end_offset <= self.dataset_params.min_end_offset, (
+            "Max end offset must be less than or equal to min end offset"
+        )
+        assert self.dataset_params.max_window_size > 0, "Max window size must be positive"
+        assert self.dataset_params.kv_resample_multiplier > 0, "kv_resample_multiplier must be positive"
+
+    def create_dataset(self) -> None:
+        tokenizer = load_tokenizer(self.dataset_config.model_name)
+
+        train_datapoints, test_datapoints = get_classification_datapoints(
+            self.dataset_params.classification_dataset_name,
+            self.dataset_params.num_qa_per_sample,
+            self.dataset_config.num_train,
+            self.dataset_config.num_test,
+            self.dataset_config.seed,
+        )
+
+        for split in self.dataset_config.splits:
+            if split == "train":
+                datapoints = train_datapoints
+            else:
+                datapoints = test_datapoints
+
+            data = create_kv_cache_vector_dataset(
+                datapoints,
+                tokenizer,
+                min_end_offset=self.dataset_params.min_end_offset,
+                max_end_offset=self.dataset_params.max_end_offset,
+                max_window_size=self.dataset_params.max_window_size,
+                min_window_size=self.dataset_params.min_window_size,
+                kv_resample_multiplier=self.dataset_params.kv_resample_multiplier,
+                datapoint_type=self.dataset_config.dataset_name,
+            )
+
+            self.save_dataset(data, split)
+
+
+def create_kv_cache_vector_dataset(
+    datapoints: list[ClassificationDatapoint],
+    tokenizer: AutoTokenizer,
+    min_end_offset: int,
+    max_end_offset: int,
+    max_window_size: int,
+    min_window_size: int,
+    kv_resample_multiplier: int,
+    datapoint_type: str,
+) -> list[TrainingDataPoint]:
+    """Create classification dataset for KV cache mode.
+    
+    Instead of looping over layers, creates kv_resample_multiplier independent
+    samples per context with different random windows.
+    
+    Args:
+        datapoints: Classification datapoints with context and question
+        tokenizer: Tokenizer
+        min_end_offset: Minimum offset from end of context (e.g., -3)
+        max_end_offset: Maximum offset from end (e.g., -5, must be <= min)
+        max_window_size: Maximum window size for multi-token
+        min_window_size: Minimum window size (1 for single-token)
+        kv_resample_multiplier: Number of independent samples per context
+        datapoint_type: Type identifier for the datapoint
+    """
+    assert min_end_offset < 0, "Min end offset must be negative"
+    assert max_end_offset < 0, "Max end offset must be negative"
+    assert max_end_offset <= min_end_offset, "Max end offset must be less than or equal to min end offset"
+    assert tokenizer.padding_side == "left", "Padding side must be left"
+    
+    training_data = []
+
+    for datapoint in tqdm(datapoints, desc="Creating KV cache classification data"):
+        # Tokenize the context
+        formatted_prompt = [{"role": "user", "content": datapoint.activation_prompt}]
+        tokenized_str = tokenizer.apply_chat_template(formatted_prompt, tokenize=False)
+        input_ids_L = tokenizer(
+            tokenized_str,
+            return_tensors=None,
+            add_special_tokens=False,
+            padding=False,
+        )["input_ids"]
+        
+        L = len(input_ids_L)
+        if L == 0:
+            continue
+
+        # Create kv_resample_multiplier independent samples with different random windows
+        for _ in range(kv_resample_multiplier):
+            end_offset = random.randint(max_end_offset, min_end_offset)
+            end_pos = L + end_offset
+
+            if end_pos <= 0:
+                continue
+
+            k = random.randint(min_window_size, max_window_size)
+            k = min(k, end_pos + 1)
+            if k <= 0:
+                continue
+                
+            begin_pos = end_pos - k + 1
+            positions_K = list(range(begin_pos, end_pos + 1))
+            assert len(positions_K) == k
+            assert positions_K[-1] - positions_K[0] == k - 1, "Positions must be contiguous"
+
+            classification_prompt = f"{datapoint.classification_prompt}"
+
+            training_data_point = create_kv_cache_training_datapoint(
+                datapoint_type=datapoint_type,
+                prompt=classification_prompt,
+                target_response=datapoint.target_response,
+                tokenizer=tokenizer,
+                context_input_ids=input_ids_L,
+                context_positions=positions_K,
+                feature_idx=-1,
+                ds_label=datapoint.ds_label,
+            )
+            training_data.append(training_data_point)
 
     return training_data
 

@@ -35,21 +35,26 @@ class EvalStepResult(BaseModel):
 
 class TrainingDataPoint(BaseModel):
     """Training data point with tensors.
-    If steering_vectors is None, then we calculate the steering vectors on the fly
-    from the context_input_ids and context_positions."""
+    
+    Two modes of operation:
+    1. Steering mode (original): steering_vectors is not None, activations are injected at positions
+    2. KV cache mode: steering_vectors is None, context_input_ids/context_positions define KV attention
+    
+    In KV cache mode, context_positions specifies which tokens in context_input_ids the oracle
+    prompt should attend to (contiguous window for single/multi-token cases)."""
 
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
 
     datapoint_type: str
     input_ids: list[int]
     labels: list[int]  # Can contain -100 for ignored tokens
-    layer: int
+    layer: int  # Layer for steering mode, -1 for KV cache mode
     steering_vectors: torch.Tensor | None
-    positions: list[int]
+    positions: list[int]  # Positions of " ?" tokens in input_ids (for steering mode)
     feature_idx: int
     target_output: str
     context_input_ids: list[int] | None
-    context_positions: list[int] | None
+    context_positions: list[int] | None  # Which context tokens to attend to (KV cache mode)
     ds_label: str | None  # label from the dataset
     meta_info: Mapping[str, Any] = {}
 
@@ -57,13 +62,16 @@ class TrainingDataPoint(BaseModel):
     def _check_context_alignment(cls, values):
         sv = values.steering_vectors
         if sv is not None:
+            # Steering mode: positions must match steering_vectors
             if len(values.positions) != sv.shape[0]:
                 raise ValueError("positions and steering_vectors must have the same length")
         else:
+            # KV cache mode: need context info
             if values.context_positions is None or values.context_input_ids is None:
                 raise ValueError("context_* must be provided when steering_vectors is None")
-            if len(values.positions) != len(values.context_positions):
-                raise ValueError("positions and context_positions must have the same length")
+            # In KV cache mode, positions (for " ?" tokens) and context_positions can differ
+            # positions = where " ?" tokens are in the oracle prompt
+            # context_positions = which context tokens to attend to
         return values
 
 
@@ -78,6 +86,28 @@ class BatchData(BaseModel):
     steering_vectors: list[torch.Tensor]
     positions: list[list[int]]
     feature_indices: list[int]
+
+
+class KVCacheBatchData(BaseModel):
+    """Batch of training data for KV cache mode.
+    
+    context_input_ids: padded context tokens [B, C_max]
+    context_attention_mask: which context tokens are real (not padding) [B, C_max]
+    oracle_input_ids: padded oracle prompt tokens [B, O_max]
+    oracle_labels: labels for oracle tokens [B, O_max]
+    oracle_attention_mask: which oracle tokens are real [B, O_max]
+    context_positions: which context positions each oracle can attend to [B, list of positions]
+    """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
+
+    context_input_ids: torch.Tensor  # [B, C_max]
+    context_attention_mask: torch.Tensor  # [B, C_max]
+    oracle_input_ids: torch.Tensor  # [B, O_max]
+    oracle_labels: torch.Tensor  # [B, O_max]
+    oracle_attention_mask: torch.Tensor  # [B, O_max]
+    context_positions: list[list[int]]  # Positions in context to attend to (before padding adjustment)
+    context_padding_lengths: list[int]  # How much left padding was added to each context
 
 
 def construct_batch(
@@ -131,6 +161,129 @@ def construct_batch(
         positions=batch_positions,
         feature_indices=batch_feature_indices,
     )
+
+
+def construct_kv_cache_batch(
+    training_data: list[TrainingDataPoint],
+    tokenizer: AutoTokenizer,
+    device: torch.device,
+) -> KVCacheBatchData:
+    """Construct a batch for KV cache training mode.
+    
+    Separates context (for KV caching) from oracle prompt (for forward pass).
+    The oracle prompt is the full input_ids which includes the " ?" tokens and question.
+    """
+    # Find max lengths for padding
+    max_context_len = max(len(dp.context_input_ids) for dp in training_data)
+    max_oracle_len = max(len(dp.input_ids) for dp in training_data)
+
+    context_tokens = []
+    context_attn_masks = []
+    oracle_tokens = []
+    oracle_labels = []
+    oracle_attn_masks = []
+    context_positions_list = []
+    context_padding_lengths = []
+
+    pad_id = tokenizer.pad_token_id
+
+    for dp in training_data:
+        # Context: left-pad
+        ctx_len = len(dp.context_input_ids)
+        ctx_pad_len = max_context_len - ctx_len
+        padded_ctx = [pad_id] * ctx_pad_len + list(dp.context_input_ids)
+        ctx_mask = [False] * ctx_pad_len + [True] * ctx_len
+
+        context_tokens.append(torch.tensor(padded_ctx, dtype=torch.long, device=device))
+        context_attn_masks.append(torch.tensor(ctx_mask, dtype=torch.bool, device=device))
+        context_padding_lengths.append(ctx_pad_len)
+
+        # Oracle prompt: left-pad
+        oracle_len = len(dp.input_ids)
+        oracle_pad_len = max_oracle_len - oracle_len
+        padded_oracle = [pad_id] * oracle_pad_len + dp.input_ids
+        padded_labels = [-100] * oracle_pad_len + dp.labels
+        oracle_mask = [False] * oracle_pad_len + [True] * oracle_len
+
+        oracle_tokens.append(torch.tensor(padded_oracle, dtype=torch.long, device=device))
+        oracle_labels.append(torch.tensor(padded_labels, dtype=torch.long, device=device))
+        oracle_attn_masks.append(torch.tensor(oracle_mask, dtype=torch.bool, device=device))
+
+        # Store original context_positions (will adjust for padding in attention mask creation)
+        context_positions_list.append(list(dp.context_positions))
+
+    return KVCacheBatchData(
+        context_input_ids=torch.stack(context_tokens),
+        context_attention_mask=torch.stack(context_attn_masks),
+        oracle_input_ids=torch.stack(oracle_tokens),
+        oracle_labels=torch.stack(oracle_labels),
+        oracle_attention_mask=torch.stack(oracle_attn_masks),
+        context_positions=context_positions_list,
+        context_padding_lengths=context_padding_lengths,
+    )
+
+
+def create_kv_attention_mask(
+    batch: KVCacheBatchData,
+    attend_full_context: bool = False,
+    device: torch.device = None,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Create 4D attention mask for KV cache mode.
+    
+    Returns mask of shape [B, 1, O, C + O] where:
+    - B = batch size
+    - O = oracle sequence length (after padding)
+    - C = context sequence length (after padding)
+    
+    The mask is in the format expected by HuggingFace models:
+    - 0.0 = attend
+    - -inf (large negative) = don't attend
+    
+    For each oracle token at position i:
+    - Can attend to selected context positions (or all if attend_full_context=True)
+    - Can attend to oracle positions 0..i (causal within oracle)
+    """
+    B = batch.oracle_input_ids.shape[0]
+    O = batch.oracle_input_ids.shape[1]
+    C = batch.context_input_ids.shape[1]
+    
+    if device is None:
+        device = batch.oracle_input_ids.device
+
+    # Initialize with all masked (-inf)
+    # Shape: [B, 1, O, C + O]
+    mask = torch.full((B, 1, O, C + O), float('-inf'), device=device, dtype=dtype)
+
+    for b in range(B):
+        # Get padding info
+        ctx_pad_len = batch.context_padding_lengths[b]
+        oracle_pad_len = (batch.oracle_attention_mask[b] == False).sum().item()
+        
+        # Context attention: only to selected positions (adjusted for padding)
+        if attend_full_context:
+            # Attend to all non-padding context positions
+            ctx_start = ctx_pad_len
+            ctx_end = C
+            mask[b, 0, :, ctx_start:ctx_end] = 0.0
+        else:
+            # Attend only to selected context positions
+            for pos in batch.context_positions[b]:
+                adjusted_pos = pos + ctx_pad_len
+                if 0 <= adjusted_pos < C:
+                    mask[b, 0, :, adjusted_pos] = 0.0
+
+        # Oracle self-attention: causal mask within oracle tokens
+        # Each oracle token i can attend to oracle tokens 0..i
+        # Oracle tokens start at position C in the combined sequence
+        for i in range(O):
+            # Only unmask if this oracle position is not padding
+            if i >= oracle_pad_len:
+                # Can attend to all previous non-padding oracle tokens (causal)
+                for j in range(oracle_pad_len, i + 1):
+                    mask[b, 0, i, C + j] = 0.0
+
+    return mask
 
 
 def get_prompt_tokens_only(
@@ -358,6 +511,99 @@ def create_training_datapoint(
         datapoint_type=datapoint_type,
         context_input_ids=context_input_ids,
         context_positions=context_positions,
+        ds_label=ds_label,
+        meta_info=meta_info,
+    )
+
+    return training_data_point
+
+
+def create_kv_cache_training_datapoint(
+    datapoint_type: str,
+    prompt: str,
+    target_response: str,
+    tokenizer: AutoTokenizer,
+    context_input_ids: list[int],
+    context_positions: list[int],
+    feature_idx: int = -1,
+    ds_label: str | None = None,
+    meta_info: Mapping[str, Any] | None = None,
+) -> TrainingDataPoint:
+    """Create a training datapoint for KV cache mode.
+    
+    Unlike steering mode, this does NOT add a "Layer: X" prefix or " ?" tokens.
+    The oracle prompt is just the question, and attention to context is controlled
+    via the attention mask based on context_positions.
+    
+    Args:
+        datapoint_type: Type identifier for the datapoint
+        prompt: The oracle question/prompt (no prefix added)
+        target_response: Expected response
+        tokenizer: Tokenizer to use
+        context_input_ids: Full context tokens (will be cached as KV)
+        context_positions: Which positions in context to attend to (contiguous window)
+        feature_idx: Feature index (-1 for non-SAE data)
+        ds_label: Dataset label
+        meta_info: Additional metadata
+    """
+    if meta_info is None:
+        meta_info = {}
+
+    input_messages = [{"role": "user", "content": prompt}]
+
+    input_prompt_ids = tokenizer.apply_chat_template(
+        input_messages,
+        tokenize=True,
+        add_generation_prompt=True,
+        return_tensors=None,
+        padding=False,
+        enable_thinking=False,
+    )
+    if not isinstance(input_prompt_ids, list):
+        raise TypeError("Expected list of token ids from tokenizer")
+
+    full_messages = input_messages + [{"role": "assistant", "content": target_response}]
+
+    full_prompt_ids = tokenizer.apply_chat_template(
+        full_messages,
+        tokenize=True,
+        add_generation_prompt=False,
+        return_tensors=None,
+        padding=False,
+        enable_thinking=False,
+    )
+    if not isinstance(full_prompt_ids, list):
+        raise TypeError("Expected list of token ids from tokenizer")
+
+    assistant_start_idx = len(input_prompt_ids)
+
+    labels = full_prompt_ids.copy()
+    for i in range(assistant_start_idx):
+        labels[i] = -100
+
+    # Validate context_positions are within bounds and contiguous
+    if len(context_positions) > 0:
+        assert all(0 <= p < len(context_input_ids) for p in context_positions), (
+            f"context_positions {context_positions} out of bounds for context of length {len(context_input_ids)}"
+        )
+        # Check contiguity for multi-token case
+        if len(context_positions) > 1:
+            sorted_pos = sorted(context_positions)
+            assert sorted_pos[-1] - sorted_pos[0] == len(sorted_pos) - 1, (
+                f"context_positions must be contiguous, got {context_positions}"
+            )
+
+    training_data_point = TrainingDataPoint(
+        input_ids=full_prompt_ids,
+        labels=labels,
+        layer=-1,  # KV cache mode indicator
+        steering_vectors=None,
+        positions=[],  # No " ?" tokens in KV cache mode
+        feature_idx=feature_idx,
+        target_output=target_response,
+        datapoint_type=datapoint_type,
+        context_input_ids=list(context_input_ids),
+        context_positions=list(context_positions),
         ds_label=ds_label,
         meta_info=meta_info,
     )

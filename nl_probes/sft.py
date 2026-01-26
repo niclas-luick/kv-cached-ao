@@ -32,9 +32,21 @@ from nl_probes.dataset_classes.act_dataset_manager import ActDatasetLoader, Data
 from nl_probes.dataset_classes.classification import (
     ClassificationDatasetConfig,
     ClassificationDatasetLoader,
+    KVCacheClassificationDatasetConfig,
+    KVCacheClassificationDatasetLoader,
 )
-from nl_probes.dataset_classes.latentqa_dataset import LatentQADatasetConfig, LatentQADatasetLoader
-from nl_probes.dataset_classes.past_lens_dataset import PastLensDatasetConfig, PastLensDatasetLoader
+from nl_probes.dataset_classes.latentqa_dataset import (
+    LatentQADatasetConfig,
+    LatentQADatasetLoader,
+    KVCacheLatentQADatasetConfig,
+    KVCacheLatentQADatasetLoader,
+)
+from nl_probes.dataset_classes.past_lens_dataset import (
+    PastLensDatasetConfig,
+    PastLensDatasetLoader,
+    KVCachePastLensDatasetConfig,
+    KVCachePastLensDatasetLoader,
+)
 from nl_probes.dataset_classes.sae_training_data import (
     SAEActivatingSequencesDatasetConfig,
     SAEActivatingSequencesDatasetLoader,
@@ -47,10 +59,13 @@ from nl_probes.utils.activation_utils import get_hf_submodule, get_text_only_lor
 from nl_probes.utils.common import load_model, load_tokenizer, set_seed
 from nl_probes.utils.dataset_utils import (
     BatchData,
+    KVCacheBatchData,
     EvalStepResult,
     FeatureResult,
     TrainingDataPoint,
     construct_batch,
+    construct_kv_cache_batch,
+    create_kv_attention_mask,
     materialize_missing_steering_vectors,
 )
 from nl_probes.utils.eval import run_evaluation, score_eval_responses
@@ -232,6 +247,59 @@ def train_features_batch(
     return loss
 
 
+def train_kv_cache_batch(
+    cfg: SelfInterpTrainingConfig,
+    training_batch: KVCacheBatchData,
+    model: PeftModel,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """
+    Trains the model on a single batch using KV cache mode.
+    
+    1. Run base model (without LoRA) on context to get KV cache
+    2. Run LoRA model on oracle prompt, attending to cached KV
+    
+    The model parameter should be a PeftModel so we can disable adapters for context.
+    """
+    batch_size = training_batch.context_input_ids.shape[0]
+    
+    # Step 1: Cache context KV using base model (without LoRA)
+    context_inputs = {
+        "input_ids": training_batch.context_input_ids,
+        "attention_mask": training_batch.context_attention_mask,
+        "use_cache": True,
+    }
+    
+    with torch.no_grad():
+        with model.disable_adapter():
+            context_outputs = model(**context_inputs)
+            past_key_values = context_outputs.past_key_values
+    
+    # Step 2: Create the 4D attention mask for selective attention
+    # Oracle tokens can only attend to selected context positions + causal self-attention
+    kv_attention_mask = create_kv_attention_mask(
+        training_batch,
+        attend_full_context=cfg.attend_full_context,
+        device=device,
+        dtype=dtype,
+    )
+    
+    # Step 3: Run LoRA model on oracle prompt with KV cache
+    oracle_inputs = {
+        "input_ids": training_batch.oracle_input_ids,
+        "attention_mask": kv_attention_mask,
+        "past_key_values": past_key_values,
+        "labels": training_batch.oracle_labels,
+        "use_cache": False,  # Don't need to cache oracle KV during training
+    }
+    
+    # LoRA is enabled for this forward pass
+    loss = model(**oracle_inputs).loss
+    
+    return loss
+
+
 def eval_all_datasets(
     cfg: SelfInterpTrainingConfig,
     eval_datasets: dict[str, list[TrainingDataPoint]],
@@ -275,6 +343,119 @@ def eval_all_datasets(
     gc.collect()
 
 
+def eval_all_datasets_kv_cache(
+    cfg: SelfInterpTrainingConfig,
+    eval_datasets: dict[str, list[TrainingDataPoint]],
+    model: PeftModel,
+    tokenizer: PreTrainedTokenizer,
+    device: torch.device,
+    dtype: torch.dtype,
+    global_step: int,
+) -> None:
+    """Evaluation using KV cache mode."""
+    model.eval()
+    eval_results = {}
+    
+    for ds_name, eval_data in eval_datasets.items():
+        eval_responses = run_evaluation_kv_cache(
+            eval_data=eval_data,
+            model=model,
+            tokenizer=tokenizer,
+            device=device,
+            dtype=dtype,
+            global_step=global_step,
+            eval_batch_size=cfg.eval_batch_size,
+            generation_kwargs=cfg.generation_kwargs,
+            attend_full_context=cfg.attend_full_context,
+        )
+        percent_format_correct, percent_ans_correct = score_eval_responses(eval_responses, eval_data)
+        eval_results[f"eval_format_correct/{ds_name}"] = percent_format_correct
+        eval_results[f"eval_ans_correct/{ds_name}"] = percent_ans_correct
+        print(f"Step {global_step} {ds_name} format correct: {percent_format_correct}, ans correct: {percent_ans_correct}")
+
+    wandb.log(eval_results, step=global_step)
+    wandb.summary.update(eval_results)
+    model.train()
+
+    torch.cuda.empty_cache()
+    gc.collect()
+
+
+def run_evaluation_kv_cache(
+    eval_data: list[TrainingDataPoint],
+    model: PeftModel,
+    tokenizer: PreTrainedTokenizer,
+    device: torch.device,
+    dtype: torch.dtype,
+    global_step: int,
+    eval_batch_size: int,
+    generation_kwargs: dict,
+    attend_full_context: bool = False,
+) -> list[FeatureResult]:
+    """Run evaluation using KV cache mode for generation."""
+    from nl_probes.utils.dataset_utils import get_prompt_tokens_only
+    
+    all_results = []
+    
+    for i in tqdm(range(0, len(eval_data), eval_batch_size), desc=f"Evaluating (KV cache) step {global_step}"):
+        batch_data = eval_data[i : i + eval_batch_size]
+        
+        # Get prompt tokens only (remove response for generation)
+        batch_data = [get_prompt_tokens_only(dp) for dp in batch_data]
+        
+        # Construct KV cache batch
+        batch = construct_kv_cache_batch(batch_data, tokenizer, device)
+        
+        # Cache context KV using base model (without LoRA)
+        context_inputs = {
+            "input_ids": batch.context_input_ids,
+            "attention_mask": batch.context_attention_mask,
+            "use_cache": True,
+        }
+        
+        with torch.no_grad():
+            with model.disable_adapter():
+                context_outputs = model(**context_inputs)
+                past_key_values = context_outputs.past_key_values
+        
+        # Create attention mask for generation
+        kv_attention_mask = create_kv_attention_mask(
+            batch,
+            attend_full_context=attend_full_context,
+            device=device,
+            dtype=dtype,
+        )
+        
+        # Generate with LoRA model
+        with torch.no_grad():
+            outputs = model.generate(
+                input_ids=batch.oracle_input_ids,
+                attention_mask=kv_attention_mask,
+                past_key_values=past_key_values,
+                pad_token_id=tokenizer.pad_token_id,
+                **generation_kwargs,
+            )
+        
+        # Decode responses
+        for j, output in enumerate(outputs):
+            # Remove the input tokens from the output
+            generated_tokens = output[batch.oracle_input_ids.shape[1]:]
+            response = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+            
+            # Get the original prompt for logging
+            prompt_tokens = batch_data[j].input_ids
+            prompt = tokenizer.decode(prompt_tokens, skip_special_tokens=True)
+            
+            result = FeatureResult(
+                feature_idx=batch_data[j].feature_idx,
+                api_response=response,
+                prompt=prompt,
+            )
+            all_results.append(result)
+    
+    return all_results
+
+
 def oom_preflight_check(
     cfg: SelfInterpTrainingConfig,
     training_data: list[TrainingDataPoint],
@@ -302,6 +483,38 @@ def oom_preflight_check(
     gc.collect()
 
     print("OOM preflight check complete")
+
+
+def oom_preflight_check_kv_cache(
+    cfg: SelfInterpTrainingConfig,
+    training_data: list[TrainingDataPoint],
+    model: PeftModel,
+    tokenizer: PreTrainedTokenizer,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> None:
+    """OOM preflight check for KV cache mode."""
+    # Find the datapoint with longest combined context + oracle
+    longest_combined = max(
+        training_data,
+        key=lambda x: len(x.context_input_ids) + len(x.input_ids)
+    )
+    long_prompts = [longest_combined] * cfg.train_batch_size
+    largest_possible_batch = construct_kv_cache_batch(long_prompts, tokenizer, device)
+
+    dummy_optimizer = torch.optim.AdamW(model.parameters(), lr=0.0)
+
+    for _ in tqdm(range(3), desc="OOM preflight check (KV cache)"):
+        loss = train_kv_cache_batch(cfg, largest_possible_batch, model, device, dtype)
+        loss.backward()
+        dummy_optimizer.step()
+        dummy_optimizer.zero_grad()
+
+    del dummy_optimizer
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    print("OOM preflight check (KV cache) complete")
 
 
 def train_model(
@@ -334,7 +547,8 @@ def train_model(
         model.use_cache = False
         model.gradient_checkpointing_enable()
 
-    submodule = get_hf_submodule(model, cfg.hook_onto_layer)
+    # Only needed for steering mode
+    submodule = None if cfg.use_kv_cache else get_hf_submodule(model, cfg.hook_onto_layer)
 
     if cfg.use_lora and cfg.load_lora_path is None:
         target_modules = cfg.lora_target_modules
@@ -367,7 +581,11 @@ def train_model(
 
     train_model_module.train()
 
-    oom_preflight_check(cfg, training_data, model, submodule, tokenizer, device, dtype)
+    # OOM preflight check - use appropriate function based on mode
+    if cfg.use_kv_cache:
+        oom_preflight_check_kv_cache(cfg, training_data, model, tokenizer, device, dtype)
+    else:
+        oom_preflight_check(cfg, training_data, model, submodule, tokenizer, device, dtype)
 
     set_seed(cfg.seed)
 
@@ -432,13 +650,17 @@ def train_model(
         ):
             t_batch_list: list[TrainingDataPoint] = training_data[start : start + cfg.train_batch_size]
 
-            # Compute missing steering vectors using the PEFT model (not DDP wrapper)
-            t_batch_list = materialize_missing_steering_vectors(t_batch_list, tokenizer, model)
-
-            t_batch = construct_batch(t_batch_list, tokenizer, device)
-
-            # Forward/backward on the DDP-wrapped module if enabled
-            loss = train_features_batch(cfg, t_batch, train_model_module, submodule, device, dtype)
+            if cfg.use_kv_cache:
+                # KV cache mode: construct batch and train with KV caching
+                t_batch = construct_kv_cache_batch(t_batch_list, tokenizer, device)
+                # Use the underlying PEFT model for KV cache (need disable_adapter)
+                loss = train_kv_cache_batch(cfg, t_batch, model, device, dtype)
+            else:
+                # Steering mode: materialize steering vectors and use hooks
+                t_batch_list = materialize_missing_steering_vectors(t_batch_list, tokenizer, model)
+                t_batch = construct_batch(t_batch_list, tokenizer, device)
+                # Forward/backward on the DDP-wrapped module if enabled
+                loss = train_features_batch(cfg, t_batch, train_model_module, submodule, device, dtype)
             loss = loss / cfg.gradient_accumulation_steps
             loss.backward()
             accumulated_loss += loss.item()
@@ -465,7 +687,10 @@ def train_model(
                 # -------------------------------- evaluation --------------------------------
                 if global_step % cfg.eval_steps == 0 and (cfg.eval_on_start or global_step > 0):
                     if rank == 0:
-                        eval_all_datasets(cfg, eval_datasets, model, tokenizer, submodule, device, dtype, global_step)
+                        if cfg.use_kv_cache:
+                            eval_all_datasets_kv_cache(cfg, eval_datasets, model, tokenizer, device, dtype, global_step)
+                        else:
+                            eval_all_datasets(cfg, eval_datasets, model, tokenizer, submodule, device, dtype, global_step)
                     dist.barrier()
 
                 if global_step % cfg.save_steps == 0 and global_step > 0:
@@ -495,7 +720,10 @@ def train_model(
 
         # Final evaluation
         print("Running final evaluation...")
-        eval_all_datasets(cfg, eval_datasets, model, tokenizer, submodule, device, dtype, global_step)
+        if cfg.use_kv_cache:
+            eval_all_datasets_kv_cache(cfg, eval_datasets, model, tokenizer, device, dtype, global_step)
+        else:
+            eval_all_datasets(cfg, eval_datasets, model, tokenizer, submodule, device, dtype, global_step)
         wandb.finish()
 
         # Push to Hugging Face if configured
@@ -785,6 +1013,140 @@ def build_loader_groups(
     }
 
 
+def build_kv_cache_loader_groups(
+    *,
+    model_name: str,
+    classification_datasets: dict[str, dict[str, Any]],
+    kv_resample_multiplier: int = 3,
+) -> dict[str, list[ActDatasetLoader]]:
+    """Build dataset loaders for KV cache mode.
+    
+    Key differences from steering mode:
+    - No layer_percents (all layers available via KV cache)
+    - Uses kv_resample_multiplier for classification and pastlens (default=3)
+    - No SAE datasets (per user requirement)
+    - LatentQA has no multiplier (originally only sampled one layer randomly)
+    """
+    DEBUG = False
+    num_datapoints = 100_000
+
+    if DEBUG:
+        print("DEBUG mode: using small datasets")
+        num_datapoints = 100
+
+    # PastLens: build both single-token and multi-token variants for KV cache mode
+    past_lens_single = KVCachePastLensDatasetLoader(
+        dataset_config=mk_cfg(
+            KVCachePastLensDatasetConfig(
+                max_k_activations=1,
+                max_k_tokens=50,
+                kv_resample_multiplier=kv_resample_multiplier,
+            ),
+            num_train=num_datapoints,
+            num_test=0,
+            splits=["train"],
+            model_name=model_name,
+            layer_percents=[],  # Not used in KV cache mode
+            save_acts=False,
+            batch_size=train_batch_size,
+        )
+    )
+
+    past_lens_multi = KVCachePastLensDatasetLoader(
+        dataset_config=mk_cfg(
+            KVCachePastLensDatasetConfig(
+                max_k_activations=50,
+                max_k_tokens=50,
+                kv_resample_multiplier=kv_resample_multiplier,
+            ),
+            num_train=num_datapoints,
+            num_test=0,
+            splits=["train"],
+            model_name=model_name,
+            layer_percents=[],  # Not used in KV cache mode
+            save_acts=False,
+            batch_size=train_batch_size,
+        )
+    )
+
+    # LatentQA: no multiplier (originally only sampled one layer randomly)
+    latent_qa_loader = KVCacheLatentQADatasetLoader(
+        dataset_config=mk_cfg(
+            custom_params=KVCacheLatentQADatasetConfig(),
+            num_train=100_000,
+            num_test=0,
+            splits=["train"],
+            model_name=model_name,
+            layer_percents=[],  # Not used in KV cache mode
+            save_acts=False,
+            batch_size=train_batch_size,
+        )
+    )
+
+    # Classification: build both single-token and multi-token variants for KV cache mode
+    classification_loaders: list[ActDatasetLoader] = []
+    for ds_name, meta in classification_datasets.items():
+        single_params = KVCacheClassificationDatasetConfig(
+            classification_dataset_name=ds_name,
+            max_window_size=1,
+            min_end_offset=-1,
+            max_end_offset=-5,
+            num_qa_per_sample=2,
+            kv_resample_multiplier=kv_resample_multiplier,
+        )
+        multi_params = KVCacheClassificationDatasetConfig(
+            classification_dataset_name=ds_name,
+            max_window_size=50,
+            min_end_offset=-1,
+            max_end_offset=-5,
+            num_qa_per_sample=1,
+            kv_resample_multiplier=kv_resample_multiplier,
+        )
+
+        # language identification has very long sequence lengths
+        if "batch_size" in meta:
+            bs = meta["batch_size"]
+        else:
+            bs = train_batch_size
+
+        classification_loaders.append(
+            KVCacheClassificationDatasetLoader(
+                dataset_config=mk_cfg(
+                    single_params,
+                    num_train=meta["num_train"],
+                    num_test=meta["num_test"],
+                    splits=meta["splits"],
+                    model_name=model_name,
+                    layer_percents=[],  # Not used in KV cache mode
+                    save_acts=False,
+                    batch_size=bs,
+                ),
+            )
+        )
+
+        classification_loaders.append(
+            KVCacheClassificationDatasetLoader(
+                dataset_config=mk_cfg(
+                    multi_params,
+                    num_train=meta["num_train"],
+                    num_test=meta["num_test"],
+                    splits=meta["splits"],
+                    model_name=model_name,
+                    layer_percents=[],  # Not used in KV cache mode
+                    save_acts=False,
+                    batch_size=train_batch_size,
+                ),
+            )
+        )
+
+    return {
+        "past_lens_loaders": [past_lens_single, past_lens_multi],
+        "latentqa_loaders": [latent_qa_loader],
+        "classification_loaders": classification_loaders,
+        # No SAE loaders in KV cache mode
+    }
+
+
 def _ensure_datasets_exist(dataset_loaders: list[ActDatasetLoader]) -> None:
     """Materialize datasets on disk using a single process (rank 0).
 
@@ -920,21 +1282,36 @@ if __name__ == "__main__":
 
         gradient_accumulation_steps = 1
 
-        # Build loader groups (single + multi variants)
-        loader_groups = build_loader_groups(
-            model_name=model_name,
-            layer_percents=layer_percents,
-            act_collection_batch_size=train_batch_size,
-            save_acts=save_acts,
-            classification_datasets=classification_datasets,
-            model_kwargs=model_kwargs,
-        )
+        # --- KV Cache Mode Toggle ---
+        # Set to True to use KV cache cross-attention instead of steering hooks
+        use_kv_cache_mode = False
+        kv_resample_multiplier = 3  # Only used in KV cache mode
+
+        if use_kv_cache_mode:
+            # Build KV cache loader groups (no SAEs, no layer_percents needed)
+            loader_groups = build_kv_cache_loader_groups(
+                model_name=model_name,
+                classification_datasets=classification_datasets,
+                kv_resample_multiplier=kv_resample_multiplier,
+            )
+        else:
+            # Build steering mode loader groups (original behavior)
+            loader_groups = build_loader_groups(
+                model_name=model_name,
+                layer_percents=layer_percents,
+                act_collection_batch_size=train_batch_size,
+                save_acts=save_acts,
+                classification_datasets=classification_datasets,
+                model_kwargs=model_kwargs,
+            )
 
         classification_dataset_loaders = loader_groups["classification_loaders"]
         past_lens_loaders = loader_groups["past_lens_loaders"]
-        sae_dataset_loaders = loader_groups["sae_loaders"]
-        sae_explanation_dataset_loaders = loader_groups["sae_explanation_loaders"]
         latentqa_loaders = loader_groups["latentqa_loaders"]
+        
+        # SAE loaders only available in steering mode
+        sae_dataset_loaders = loader_groups.get("sae_loaders", [])
+        sae_explanation_dataset_loaders = loader_groups.get("sae_explanation_loaders", [])
 
         iterations = [
             # Default dataset mixture
@@ -969,6 +1346,8 @@ if __name__ == "__main__":
                 eval_on_start=True,
                 gradient_checkpointing=gradient_checkpointing,
                 gradient_accumulation_steps=gradient_accumulation_steps,
+                use_kv_cache=use_kv_cache_mode,
+                attend_full_context=False,  # Set to True to attend to all context tokens
                 **hyperparam_override,
             )
 

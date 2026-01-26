@@ -18,6 +18,7 @@ from nl_probes.utils.common import layer_percent_to_layer, load_model, load_toke
 from nl_probes.utils.dataset_utils import (
     TrainingDataPoint,
     create_training_datapoint,
+    create_kv_cache_training_datapoint,
 )
 
 
@@ -29,6 +30,22 @@ class PastLensDatasetConfig(BaseDatasetConfig):
     max_k_activations: int = 20
     max_length: int = 512
     directions: list[str] = field(default_factory=lambda: ["past", "future"])
+
+
+@dataclass
+class KVCachePastLensDatasetConfig(BaseDatasetConfig):
+    """Config for KV cache mode PastLens dataset.
+    
+    Instead of per-layer sampling, uses kv_resample_multiplier to create
+    multiple independent samples per context with different random windows.
+    """
+    min_k_tokens: int = 1
+    max_k_tokens: int = 20
+    min_k_activations: int = 1
+    max_k_activations: int = 20
+    max_length: int = 512
+    directions: list[str] = field(default_factory=lambda: ["past", "future"])
+    kv_resample_multiplier: int = 3  # Create this many samples per batch item
 
 
 class PastLensDatasetLoader(ActDatasetLoader):
@@ -64,6 +81,47 @@ class PastLensDatasetLoader(ActDatasetLoader):
             dataset=dataset,
             num_datapoints=self.dataset_config.num_train,
             dtype=dtype,
+        )
+
+        self.save_dataset(training_data, "train")
+
+
+class KVCachePastLensDatasetLoader(ActDatasetLoader):
+    """Dataset loader for KV cache mode PastLens.
+    
+    Instead of creating one sample per layer, creates kv_resample_multiplier
+    independent samples per batch item with different random windows.
+    """
+    def __init__(
+        self,
+        dataset_config: DatasetLoaderConfig,
+    ):
+        super().__init__(dataset_config)
+        assert self.dataset_config.dataset_name == "", "Dataset name gets overridden here"
+
+        self.dataset_config.dataset_name = "kv_past_lens"
+
+        self.dataset_params: KVCachePastLensDatasetConfig = dataset_config.custom_dataset_params
+
+        assert self.dataset_config.splits == ["train"], "Past lens dataset only supports train split right now"
+        assert self.dataset_config.num_test == 0, "Past lens dataset only supports train split right now"
+        assert self.dataset_params.kv_resample_multiplier > 0, "kv_resample_multiplier must be positive"
+
+        if self.dataset_config.num_train < self.dataset_config.batch_size:
+            raise ValueError(
+                f"num_train {self.dataset_config.num_train} must be greater than or equal to batch_size {self.dataset_config.batch_size}"
+            )
+
+    def create_dataset(self) -> None:
+        tokenizer = load_tokenizer(self.dataset_config.model_name)
+        dataset = hf_mixed_dataset_to_generator(tokenizer)
+
+        training_data = collect_kv_cache_past_lens_data(
+            dataset_config=self.dataset_config,
+            custom_dataset_params=self.dataset_params,
+            tokenizer=tokenizer,
+            dataset=dataset,
+            num_datapoints=self.dataset_config.num_train,
         )
 
         self.save_dataset(training_data, "train")
@@ -289,6 +347,122 @@ def collect_past_lens_acts(
                     feature_idx=-1,
                     context_input_ids=context_input_ids,
                     context_positions=context_positions,
+                )
+                training_data.append(training_data_point)
+
+    return training_data
+
+
+def collect_kv_cache_past_lens_data(
+    dataset_config: DatasetLoaderConfig,
+    custom_dataset_params: KVCachePastLensDatasetConfig,
+    tokenizer: AutoTokenizer,
+    dataset: Generator,
+    num_datapoints: int,
+) -> list[TrainingDataPoint]:
+    """Collect PastLens data for KV cache mode.
+    
+    Instead of looping over layers, creates kv_resample_multiplier independent
+    samples per batch item with different random windows.
+    
+    Key differences from original:
+    - No layer loop (all layers available via KV cache)
+    - kv_resample_multiplier samples per batch item instead of 1 per layer
+    - Uses create_kv_cache_training_datapoint (no layer prefix)
+    """
+    random.seed(dataset_config.seed)
+    torch.manual_seed(dataset_config.seed)
+
+    training_data = []
+    
+    kv_mult = custom_dataset_params.kv_resample_multiplier
+
+    for i in tqdm(range(0, num_datapoints, dataset_config.batch_size), desc="Collecting KV cache past lens data"):
+        inputs = []
+        for _ in range(dataset_config.batch_size):
+            inputs.append(next(dataset))
+
+        tokenized_inputs = tokenizer(
+            inputs,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=custom_dataset_params.max_length,
+            add_special_tokens=False,
+        )
+
+        attn_mask_BL = tokenized_inputs["attention_mask"]
+        input_ids_BL = tokenized_inputs["input_ids"]
+
+        for j in range(len(inputs)):
+            attn_mask_L = attn_mask_BL[j].bool()
+            input_ids_L_full = input_ids_BL[j, attn_mask_L].tolist()
+            L = len(input_ids_L_full)
+
+            # Create kv_resample_multiplier independent samples per batch item
+            for _ in range(kv_mult):
+                # Number of tokens to predict (before or after), and number of activation positions
+                k_tokens = random.randint(custom_dataset_params.min_k_tokens, custom_dataset_params.max_k_tokens)
+                k_acts = random.randint(
+                    custom_dataset_params.min_k_activations, custom_dataset_params.max_k_activations
+                )
+
+                # Randomly choose direction per example
+                direction = random.choice(custom_dataset_params.directions)
+                if direction not in {"past", "future"}:
+                    raise ValueError(f"{custom_dataset_params}")
+
+                # Compute valid ranges and positions safely
+                if direction == "past":
+                    # Need at least k_tokens before the act span and at least 1 token after
+                    if L < k_tokens + k_acts + 1:
+                        continue
+                    act_begin_min = k_tokens
+                    act_begin_max = L - k_acts - 1
+                    if act_begin_max < act_begin_min:
+                        continue
+                    selected_act_begin_idx = random.randint(act_begin_min, act_begin_max)
+                    selected_act_positions = list(range(selected_act_begin_idx, selected_act_begin_idx + k_acts))
+                    selected_tokens_positions = list(range(selected_act_begin_idx - k_tokens, selected_act_begin_idx))
+                    # Context only needs to include up through the last act position
+                    context_cutoff = selected_act_positions[-1]
+                    target_tokens = [input_ids_L_full[p] for p in selected_tokens_positions]
+                    target_text = tokenizer.decode(target_tokens, skip_special_tokens=True)
+                    prompt = f"Can you predict the previous {k_tokens} tokens that came before this?"
+                else:  # direction == "future"
+                    # Need at least 1 token before the act span and k_tokens after the act span
+                    if L < k_tokens + k_acts + 1:
+                        continue
+                    act_begin_min = 1
+                    act_begin_max = L - k_acts - k_tokens
+                    if act_begin_max < act_begin_min:
+                        continue
+                    selected_act_begin_idx = random.randint(act_begin_min, act_begin_max)
+                    selected_act_positions = list(range(selected_act_begin_idx, selected_act_begin_idx + k_acts))
+                    last_act_pos = selected_act_positions[-1]
+                    selected_tokens_positions = list(range(last_act_pos + 1, last_act_pos + 1 + k_tokens))
+                    # Context only needs to include up through the last act position
+                    context_cutoff = last_act_pos
+                    target_tokens = [input_ids_L_full[p] for p in selected_tokens_positions]
+                    target_text = tokenizer.decode(target_tokens, skip_special_tokens=True)
+                    prompt = f"Can you predict the next {k_tokens} tokens that come after this?"
+
+                # Slice context input ids to what is needed (up through last act pos)
+                context_input_ids_slice = input_ids_L_full[: context_cutoff + 1]
+
+                # Verify contiguity of attention positions
+                assert selected_act_positions[-1] - selected_act_positions[0] == k_acts - 1, (
+                    "Activation positions must be contiguous"
+                )
+
+                training_data_point = create_kv_cache_training_datapoint(
+                    datapoint_type=dataset_config.dataset_name,
+                    prompt=prompt,
+                    target_response=target_text,
+                    tokenizer=tokenizer,
+                    context_input_ids=context_input_ids_slice,
+                    context_positions=selected_act_positions,
+                    feature_idx=-1,
                 )
                 training_data.append(training_data_point)
 

@@ -17,11 +17,15 @@ from nl_probes.dataset_classes.act_dataset_manager import DatasetLoaderConfig
 from nl_probes.dataset_classes.classification import (
     ClassificationDatasetConfig,
     ClassificationDatasetLoader,
+    KVCacheClassificationDatasetConfig,
+    KVCacheClassificationDatasetLoader,
 )
 from nl_probes.utils.activation_utils import get_hf_submodule
 from nl_probes.utils.common import load_model, load_tokenizer
 from nl_probes.utils.eval import parse_answer, run_evaluation
 from nl_probes.base_experiment import sanitize_lora_name
+from nl_probes.utils.dataset_utils import construct_kv_cache_batch, create_kv_attention_mask, FeatureResult
+from nl_probes.sft import run_evaluation_kv_cache
 
 # -----------------------------
 # Configuration - tune here
@@ -120,6 +124,11 @@ LAYER_PERCENTS = [0, 10]
 
 KEY_FOR_NONE = "original"
 
+# --- KV Cache Mode Toggle ---
+USE_KV_CACHE_MODE = False  # Set to True to use KV cache mode
+KV_RESAMPLE_MULTIPLIER = 3  # Only used in KV cache mode
+ATTEND_FULL_CONTEXT = False  # If True, attend to all context tokens
+
 
 @dataclass(frozen=True)
 class Method:
@@ -158,7 +167,7 @@ def get_batch_size(model_name: str) -> int:
 def load_datasets_for_layer_percent(
     model_name: str, layer_percent: int, model_kwargs: dict, model=None
 ) -> dict[str, list[Any]]:
-    """Load all classification datasets for a specific model and layer percent."""
+    """Load all classification datasets for a specific model and layer percent (steering mode)."""
     batch_size = get_batch_size(model_name)
 
     classification_dataset_loaders: list[ClassificationDatasetLoader] = []
@@ -196,6 +205,59 @@ def load_datasets_for_layer_percent(
         )
         classification_dataset_loaders.append(
             ClassificationDatasetLoader(dataset_config=dataset_config, model_kwargs=model_kwargs, model=model)
+        )
+
+    # Pull test sets for evaluation
+    all_eval_data: dict[str, list[Any]] = {}
+    for loader in classification_dataset_loaders:
+        if "test" in loader.dataset_config.splits:
+            ds_id = canonical_dataset_id(loader.dataset_config.dataset_name)
+            all_eval_data[ds_id] = loader.load_dataset("test")
+
+    return all_eval_data
+
+
+def load_kv_cache_datasets(model_name: str) -> dict[str, list[Any]]:
+    """Load all classification datasets for KV cache mode (no layer_percent needed)."""
+    batch_size = get_batch_size(model_name)
+
+    classification_dataset_loaders: list[KVCacheClassificationDatasetLoader] = []
+    for dataset_name, dcfg in CLASSIFICATION_DATASETS.items():
+        if "language_identification" in dataset_name:
+            ds_batch_size = batch_size // 8
+        else:
+            ds_batch_size = batch_size
+
+        if SINGLE_TOKEN_MODE:
+            classification_config = KVCacheClassificationDatasetConfig(
+                classification_dataset_name=dataset_name,
+                max_end_offset=-3,
+                min_end_offset=-3,
+                max_window_size=1,
+                min_window_size=1,
+                kv_resample_multiplier=KV_RESAMPLE_MULTIPLIER,
+            )
+        else:
+            classification_config = KVCacheClassificationDatasetConfig(
+                classification_dataset_name=dataset_name,
+                max_end_offset=-1,
+                min_end_offset=-1,
+                max_window_size=50,
+                min_window_size=50,
+                kv_resample_multiplier=KV_RESAMPLE_MULTIPLIER,
+            )
+        dataset_config = DatasetLoaderConfig(
+            custom_dataset_params=classification_config,
+            num_train=dcfg["num_train"],
+            num_test=dcfg["num_test"],
+            splits=dcfg["splits"],
+            model_name=model_name,
+            layer_percents=[],  # Not used in KV cache mode
+            save_acts=False,
+            batch_size=ds_batch_size,
+        )
+        classification_dataset_loaders.append(
+            KVCacheClassificationDatasetLoader(dataset_config=dataset_config)
         )
 
     # Pull test sets for evaluation
@@ -286,6 +348,72 @@ def run_eval_for_datasets(
     return results
 
 
+def run_eval_for_datasets_kv_cache(
+    model,
+    tokenizer,
+    model_name: str,
+    lora_path: str | None,
+    eval_data_by_ds: dict[str, list[Any]],
+    batch_size: int,
+) -> dict[str, dict[str, Any]]:
+    """
+    Run evaluation using KV cache mode.
+    """
+    sanitized_lora_name = None
+    if lora_path is not None:
+        sanitized_lora_name = sanitize_lora_name(lora_path)
+        if sanitized_lora_name not in model.peft_config:
+            print(f"Loading LoRA: {lora_path}")
+            model.load_adapter(
+                lora_path,
+                adapter_name=sanitized_lora_name,
+                is_trainable=False,
+                low_cpu_mem_usage=True,
+            )
+        model.set_adapter(sanitized_lora_name)
+
+    results: dict = {
+        "meta": {
+            "model_name": model_name,
+            "dtype": str(DTYPE),
+            "kv_cache_mode": True,
+            "attend_full_context": ATTEND_FULL_CONTEXT,
+            "investigator_lora_path": lora_path,
+            "eval_batch_size": batch_size,
+            "generation_kwargs": GENERATION_KWARGS,
+            "single_token_mode": SINGLE_TOKEN_MODE,
+        },
+        "records": [],
+    }
+
+    for ds_id, eval_data in eval_data_by_ds.items():
+        # Use KV cache evaluation
+        raw_results = run_evaluation_kv_cache(
+            eval_data=eval_data,
+            model=model,
+            tokenizer=tokenizer,
+            device=device,
+            dtype=dtype,
+            global_step=-1,
+            eval_batch_size=batch_size,
+            generation_kwargs=GENERATION_KWARGS,
+            attend_full_context=ATTEND_FULL_CONTEXT,
+        )
+
+        for response, target in zip(raw_results, eval_data, strict=True):
+            record = {
+                "dataset_id": ds_id,
+                "ground_truth": response.api_response,
+                "target": target.target_output,
+            }
+            results["records"].append(record)
+
+    if sanitized_lora_name is not None and sanitized_lora_name in model.peft_config:
+        model.delete_adapter(sanitized_lora_name)
+
+    return results
+
+
 # %%
 # Main loop over models and layer percents
 
@@ -303,24 +431,26 @@ for model_name in MODEL_CONFIGS:
     # Load model and tokenizer
     tokenizer = load_tokenizer(model_name)
     model = load_model(model_name, dtype, **model_kwargs)
-    submodule = get_hf_submodule(model, INJECTION_LAYER)
+    
+    # For steering mode, get submodule; for KV cache mode, not needed
+    submodule = None if USE_KV_CACHE_MODE else get_hf_submodule(model, INJECTION_LAYER)
 
     dummy_config = LoraConfig()
     model.add_adapter(dummy_config, adapter_name="default")
 
-    for layer_percent in LAYER_PERCENTS:
-        print(f"\n--- Layer percent: {layer_percent} ---")
-
-        # Create run_dir with layer_percent in folder name
-        run_dir = f"{EXPERIMENTS_DIR}/{DATA_DIR}/classification_{model_name_str}_{mode_str}_{layer_percent}/"
+    if USE_KV_CACHE_MODE:
+        # KV cache mode: no layer_percent loop needed
+        print("\n--- KV Cache Mode (no layer percents) ---")
+        
+        run_dir = f"{EXPERIMENTS_DIR}/{DATA_DIR}/classification_{model_name_str}_{mode_str}_kv_cache/"
         os.makedirs(run_dir, exist_ok=True)
-
-        # Load datasets for this layer percent (reuses the loaded model)
-        all_eval_data = load_datasets_for_layer_percent(model_name, layer_percent, model_kwargs, model=model)
+        
+        # Load KV cache datasets (no layer_percent needed)
+        all_eval_data = load_kv_cache_datasets(model_name)
         print(f"Loaded datasets: {list(all_eval_data.keys())}")
-
+        
         output_json_template = f"{run_dir}" + "classification_results_lora_{lora}.json"
-
+        
         for lora in investigator_lora_paths:
             print(f"Evaluating LORA: {lora}")
             if lora is None:
@@ -329,22 +459,59 @@ for model_name in MODEL_CONFIGS:
             else:
                 active_lora_path = f"{LORA_DIR}{lora}"
                 lora_name = lora.split("/")[-1].replace("/", "_").replace(".", "_")
-
-            results = run_eval_for_datasets(
+            
+            results = run_eval_for_datasets_kv_cache(
                 model=model,
                 tokenizer=tokenizer,
-                submodule=submodule,
                 model_name=model_name,
-                layer_percent=layer_percent,
                 lora_path=active_lora_path,
                 eval_data_by_ds=all_eval_data,
                 batch_size=batch_size,
             )
-
+            
             output_json = output_json_template.format(lora=lora_name)
             with open(output_json, "w") as f:
                 json.dump(results, f, indent=2)
             print(f"Saved results to {output_json}")
+    else:
+        # Steering mode: loop over layer percents
+        for layer_percent in LAYER_PERCENTS:
+            print(f"\n--- Layer percent: {layer_percent} ---")
+
+            # Create run_dir with layer_percent in folder name
+            run_dir = f"{EXPERIMENTS_DIR}/{DATA_DIR}/classification_{model_name_str}_{mode_str}_{layer_percent}/"
+            os.makedirs(run_dir, exist_ok=True)
+
+            # Load datasets for this layer percent (reuses the loaded model)
+            all_eval_data = load_datasets_for_layer_percent(model_name, layer_percent, model_kwargs, model=model)
+            print(f"Loaded datasets: {list(all_eval_data.keys())}")
+
+            output_json_template = f"{run_dir}" + "classification_results_lora_{lora}.json"
+
+            for lora in investigator_lora_paths:
+                print(f"Evaluating LORA: {lora}")
+                if lora is None:
+                    active_lora_path = None
+                    lora_name = "base_model"
+                else:
+                    active_lora_path = f"{LORA_DIR}{lora}"
+                    lora_name = lora.split("/")[-1].replace("/", "_").replace(".", "_")
+
+                results = run_eval_for_datasets(
+                    model=model,
+                    tokenizer=tokenizer,
+                    submodule=submodule,
+                    model_name=model_name,
+                    layer_percent=layer_percent,
+                    lora_path=active_lora_path,
+                    eval_data_by_ds=all_eval_data,
+                    batch_size=batch_size,
+                )
+
+                output_json = output_json_template.format(lora=lora_name)
+                with open(output_json, "w") as f:
+                    json.dump(results, f, indent=2)
+                print(f"Saved results to {output_json}")
 
     # Clean up model before loading next one
     del model
