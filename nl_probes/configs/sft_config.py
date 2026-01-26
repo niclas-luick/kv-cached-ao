@@ -55,12 +55,12 @@ class SelfInterpTrainingConfig:
     load_lora_path: str | None = None
 
     # --- Tracking ---
-    wandb_project: str = "sae_introspection"
+    wandb_project: str = "kv-cached-ao-qwen3-4b"
     wandb_run_name: str = ""  # derived if empty
     wandb_suffix: str = ""
 
     # --- Hub ---
-    hf_push_to_hub: bool = False
+    hf_push_to_hub: bool = True
     hf_private_repo: bool = False
     hf_repo_name: str = ""  # optional short name, used to compute repo_id
     hf_repo_id: str = ""  # derived if empty and push is on
