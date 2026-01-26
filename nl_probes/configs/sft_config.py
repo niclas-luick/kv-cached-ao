@@ -55,8 +55,8 @@ class SelfInterpTrainingConfig:
     load_lora_path: str | None = None
 
     # --- Tracking ---
-    wandb_project: str = "kv-cached-ao-qwen3-4b"
-    wandb_run_name: str = ""  # derived if empty
+    wandb_project: str = "activation-oracles-research"
+    wandb_run_name: str = "kv-cached-ao-qwen3-4b"  # derived if empty
     wandb_suffix: str = ""
 
     # --- Hub ---
