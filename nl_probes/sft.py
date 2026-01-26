@@ -1251,7 +1251,7 @@ if __name__ == "__main__":
     ]
 
     for model_name in models:
-        hf_repo_name = "N/A"
+        hf_repo_name = "kv-cached-ao-qwen3-4b"
 
         model_name_str = model_name.split("/")[-1].replace(".", "_").replace(" ", "_")
 
