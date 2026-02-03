@@ -3,9 +3,9 @@ Minimal script to run KV cache inference with a trained LoRA model.
 
 This demonstrates how to:
 1. Load a base model + trained LoRA adapter
-2. Cache context KV using the base model (no LoRA)
+2. Cache context KV using the base model (no LoRA) - same as training
 3. Run oracle prompt with LoRA, attending to specific context positions
-4. Generate interpretations
+4. Generate interpretations via manual decoding
 """
 
 import torch
@@ -51,12 +51,17 @@ def interpret_tokens(
     question: str,
     token_positions: list[int] | None = None,
     attend_full_context: bool = False,
-    max_new_tokens: int = 50,
+    max_new_tokens: int = 500,
     device: str = "cuda",
     dtype: torch.dtype = torch.bfloat16,
 ) -> str:
     """
     Interpret specific tokens in a context using the KV cache architecture.
+    
+    Uses the same setup as training:
+    1. Context is processed with base model (LoRA disabled) to build KV cache
+    2. Oracle prompt is processed with LoRA enabled, attending to cached context
+    3. Generation uses manual token-by-token decoding (required for transformers 4.55+)
 
     Args:
         model: PeftModel with LoRA adapter
@@ -115,7 +120,7 @@ def interpret_tokens(
     oracle_input_ids = oracle_tokens["input_ids"]
     oracle_len = oracle_input_ids.shape[1]
 
-    # Step 1: Cache context KV using base model (without LoRA)
+    # Step 1: Cache context KV using base model (without LoRA) - same as training
     with torch.no_grad():
         with model.disable_adapter():
             context_outputs = model(
@@ -125,8 +130,7 @@ def interpret_tokens(
             )
             past_key_values = context_outputs.past_key_values
 
-    # Step 2: Create selective attention mask
-    # Build a minimal KVCacheBatchData for mask creation
+    # Step 2: Create selective attention mask using the same function as training
     batch = KVCacheBatchData(
         context_input_ids=context_input_ids,
         context_attention_mask=torch.ones_like(context_input_ids, dtype=torch.bool),
@@ -134,7 +138,7 @@ def interpret_tokens(
         oracle_labels=torch.full_like(oracle_input_ids, -100),
         oracle_attention_mask=torch.ones_like(oracle_input_ids, dtype=torch.bool),
         context_positions=[token_positions],
-        context_padding_lengths=[0],  # No padding for single sample
+        context_padding_lengths=[0],
     )
 
     attention_mask = create_kv_attention_mask(
@@ -144,36 +148,64 @@ def interpret_tokens(
         dtype=dtype,
     )
 
-    # Step 3: Generate with LoRA model attending to cached KV
+    # Step 3: Process oracle prompt with LoRA and get first token prediction
+    # Manual generation loop required for transformers 4.55+ with external KV cache
     with torch.no_grad():
-        outputs = model.generate(
+        outputs = model(
             input_ids=oracle_input_ids,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            pad_token_id=tokenizer.pad_token_id,
+            use_cache=True,
         )
+        
+        past = outputs.past_key_values
+        next_token_logits = outputs.logits[:, -1, :]
+        next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+        generated_ids = [next_token]
+        
+        # Generate remaining tokens
+        for _ in range(max_new_tokens - 1):
+            if next_token.item() == tokenizer.eos_token_id:
+                break
+                
+            outputs = model(
+                input_ids=next_token,
+                past_key_values=past,
+                use_cache=True,
+            )
+            past = outputs.past_key_values
+            next_token_logits = outputs.logits[:, -1, :]
+            next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+            generated_ids.append(next_token)
 
-    # Decode response (skip the input tokens)
-    generated_tokens = outputs[0, oracle_len:]
-    response = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+    # Decode response
+    generated_tokens = torch.cat(generated_ids, dim=-1)
+    
+    # Debug: show raw tokens
+    print(f"Generated {len(generated_ids)} tokens: {generated_tokens[0].tolist()}")
+    print(f"Raw decode: {tokenizer.decode(generated_tokens[0], skip_special_tokens=False)}")
+    
+    response = tokenizer.decode(generated_tokens[0], skip_special_tokens=True)
 
     return response
 
 
 def main():
     # Configuration
-    MODEL_NAME = "Qwen/Qwen3-8B"
-    LORA_PATH = None  # Set to your HF repo path, e.g., "your-username/your-lora-repo"
+    MODEL_NAME = "Qwen/Qwen3-4B"
+    LORA_PATH = "nluick/kv-cached-ao-qwen3-4b"  # Set to your HF repo path, e.g., "your-username/your-lora-repo"
 
-    # Example context and question
-    CONTEXT = """The capital of France is Paris. It is known for the Eiffel Tower, 
-    which was built in 1889. The city has a population of about 2 million people 
-    in the city proper and over 12 million in the metropolitan area."""
+    # # Example context and question
+    # CONTEXT = """The capital of France is Paris. It is known for the Eiffel Tower, 
+    # which was built in 1889. The city has a population of about 2 million people 
+    # in the city proper and over 12 million in the metropolitan area."""
 
-    QUESTION = "What is this text about?"
+    # QUESTION = "What is this text about?"
 
+
+    CONTEXT = "Englisch ist eine schöne Sprache."
+    # QUESTION = "Answer with 'Yes' or 'No' only. Is this sentence written in English?"
+    QUESTION = "What language is this sentence written in?"
     # Token positions to attend to (None = last 5 tokens)
     TOKEN_POSITIONS = None  # Or specify like [10, 11, 12, 13, 14]
 
@@ -191,33 +223,24 @@ def main():
     model, tokenizer = load_model_with_lora(MODEL_NAME, LORA_PATH)
 
     # Check if model is a PeftModel (required for disable_adapter)
-    if LORA_PATH is None:
-        print("\nWarning: No LoRA path specified. For full KV cache mode,")
-        print("you need a trained LoRA adapter. Running with base model only.")
-        print("The disable_adapter() call will be skipped.\n")
+    if not isinstance(model, PeftModel):
+        print("\nError: LoRA adapter required for KV cache mode.")
+        print("The disable_adapter() context manager requires a PeftModel.")
+        return
 
     print(f"\nContext:\n{CONTEXT}\n")
     print(f"Question: {QUESTION}\n")
 
-    # Run interpretation
-    if isinstance(model, PeftModel):
-        response = interpret_tokens(
-            model=model,
-            tokenizer=tokenizer,
-            context=CONTEXT,
-            question=QUESTION,
-            token_positions=TOKEN_POSITIONS,
-            attend_full_context=False,
-        )
-    else:
-        # For base model without LoRA, we can't use the full KV cache architecture
-        # Just do normal generation for demo purposes
-        print("Running standard generation (no KV cache architecture)...")
-        prompt = f"Context: {CONTEXT}\n\nQuestion: {QUESTION}"
-        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-        with torch.no_grad():
-            outputs = model.generate(**inputs, max_new_tokens=50, do_sample=False)
-        response = tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+    # Run interpretation with KV cache architecture (same as training)
+    # Set attend_full_context=True to attend to all context tokens for testing
+    response = interpret_tokens(
+        model=model,
+        tokenizer=tokenizer,
+        context=CONTEXT,
+        question=QUESTION,
+        token_positions=TOKEN_POSITIONS,
+        attend_full_context=True,  # Set to False + specific token_positions for selective attention
+    )
 
     print(f"Response:\n{response}")
     print("=" * 60)
