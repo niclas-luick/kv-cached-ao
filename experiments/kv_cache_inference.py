@@ -1,250 +1,325 @@
 """
-Minimal script to run KV cache inference with a trained LoRA model.
+KV Cache Oracle for inference with trained LoRA models.
 
-This demonstrates how to:
-1. Load a base model + trained LoRA adapter
-2. Cache context KV using the base model (no LoRA) - same as training
-3. Run oracle prompt with LoRA, attending to specific context positions
-4. Generate interpretations via manual decoding
+Supports attending to different parts of the target model's output:
+- "question": attend to input question tokens only (default)
+- "cot": attend to target model's Chain-of-Thought tokens (<think>...</think>)
+- "answer": attend to target model's final answer tokens (after </think>)
+- "response": attend to full response (CoT + answer)
+- "all": attend to everything (question + response)
+
+Usage:
+    oracle = KVCacheOracle("Qwen/Qwen3-4B", "nluick/kv-cached-ao-qwen3-4b")
+    result = oracle.interpret("Some text", "What language is this?", context_type="question")
 """
+
+import logging
+from typing import Literal
 
 import torch
 from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from nl_probes.utils.dataset_utils import (
-    KVCacheBatchData,
-    create_kv_attention_mask,
-)
+from nl_probes.utils.dataset_utils import KVCacheBatchData, create_kv_attention_mask
+
+logger = logging.getLogger(__name__)
+
+ContextType = Literal["question", "cot", "answer", "response", "all"]
 
 
-def load_model_with_lora(
-    model_name: str,
-    lora_path: str | None = None,
-    dtype: torch.dtype = torch.bfloat16,
-    device: str = "cuda",
-) -> tuple[AutoModelForCausalLM | PeftModel, AutoTokenizer]:
-    """Load base model and optionally attach LoRA adapter."""
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    tokenizer.padding_side = "left"
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+class KVCacheOracle:
+    """Persistent KV-cache oracle for inference. Load once, call interpret() many times."""
 
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype=dtype,
-        device_map=device,
-    )
+    def __init__(
+        self,
+        model_name: str,
+        lora_path: str,
+        dtype: torch.dtype = torch.bfloat16,
+        device: str = "cuda",
+    ):
+        """Load base model + LoRA adapter once.
 
-    if lora_path is not None:
-        model = PeftModel.from_pretrained(model, lora_path, is_trainable=False)
-        print(f"Loaded LoRA adapter from: {lora_path}")
+        Args:
+            model_name: HuggingFace model name (e.g., "Qwen/Qwen3-4B").
+            lora_path: Path or HF repo for the trained LoRA adapter.
+            dtype: Model dtype.
+            device: Device to load model on.
+        """
+        self.model_name = model_name
+        self.device = device
+        self.dtype = dtype
 
-    model.eval()
-    return model, tokenizer
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.tokenizer.padding_side = "left"
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
 
-
-def interpret_tokens(
-    model: PeftModel,
-    tokenizer: AutoTokenizer,
-    context: str,
-    question: str,
-    token_positions: list[int] | None = None,
-    attend_full_context: bool = False,
-    max_new_tokens: int = 500,
-    device: str = "cuda",
-    dtype: torch.dtype = torch.bfloat16,
-) -> str:
-    """
-    Interpret specific tokens in a context using the KV cache architecture.
-    
-    Uses the same setup as training:
-    1. Context is processed with base model (LoRA disabled) to build KV cache
-    2. Oracle prompt is processed with LoRA enabled, attending to cached context
-    3. Generation uses manual token-by-token decoding (required for transformers 4.55+)
-
-    Args:
-        model: PeftModel with LoRA adapter
-        tokenizer: Tokenizer
-        context: The context text whose tokens we want to interpret
-        question: The oracle question to ask about the tokens
-        token_positions: Which token positions in context to attend to.
-                        If None, uses last 5 tokens.
-        attend_full_context: If True, attend to all context tokens
-        max_new_tokens: Maximum tokens to generate
-        device: Device to run on
-        dtype: Data type for attention mask
-
-    Returns:
-        Generated interpretation text
-    """
-    # Tokenize context
-    context_tokens = tokenizer(
-        context,
-        return_tensors="pt",
-        add_special_tokens=True,
-        padding=False,
-    ).to(device)
-
-    context_input_ids = context_tokens["input_ids"]
-    context_len = context_input_ids.shape[1]
-
-    # Default: attend to last 5 tokens if not specified
-    if token_positions is None:
-        token_positions = list(range(max(0, context_len - 5), context_len))
-
-    print(f"Context length: {context_len} tokens")
-    print(f"Attending to positions: {token_positions}")
-
-    # Show which tokens we're attending to
-    for pos in token_positions:
-        if pos < context_len:
-            token_id = context_input_ids[0, pos].item()
-            token_str = tokenizer.decode([token_id])
-            print(f"  Position {pos}: '{token_str}'")
-
-    # Tokenize oracle question
-    oracle_messages = [{"role": "user", "content": question}]
-    oracle_str = tokenizer.apply_chat_template(
-        oracle_messages,
-        tokenize=False,
-        add_generation_prompt=True,
-    )
-    oracle_tokens = tokenizer(
-        oracle_str,
-        return_tensors="pt",
-        add_special_tokens=False,
-        padding=False,
-    ).to(device)
-
-    oracle_input_ids = oracle_tokens["input_ids"]
-    oracle_len = oracle_input_ids.shape[1]
-
-    # Step 1: Cache context KV using base model (without LoRA) - same as training
-    with torch.no_grad():
-        with model.disable_adapter():
-            context_outputs = model(
-                input_ids=context_input_ids,
-                attention_mask=torch.ones_like(context_input_ids),
-                use_cache=True,
-            )
-            past_key_values = context_outputs.past_key_values
-
-    # Step 2: Create selective attention mask using the same function as training
-    batch = KVCacheBatchData(
-        context_input_ids=context_input_ids,
-        context_attention_mask=torch.ones_like(context_input_ids, dtype=torch.bool),
-        oracle_input_ids=oracle_input_ids,
-        oracle_labels=torch.full_like(oracle_input_ids, -100),
-        oracle_attention_mask=torch.ones_like(oracle_input_ids, dtype=torch.bool),
-        context_positions=[token_positions],
-        context_padding_lengths=[0],
-    )
-
-    attention_mask = create_kv_attention_mask(
-        batch,
-        attend_full_context=attend_full_context,
-        device=device,
-        dtype=dtype,
-    )
-
-    # Step 3: Process oracle prompt with LoRA and get first token prediction
-    # Manual generation loop required for transformers 4.55+ with external KV cache
-    with torch.no_grad():
-        outputs = model(
-            input_ids=oracle_input_ids,
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            use_cache=True,
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_name, torch_dtype=dtype, device_map=device,
         )
-        
-        past = outputs.past_key_values
-        next_token_logits = outputs.logits[:, -1, :]
-        next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
-        generated_ids = [next_token]
-        
-        # Generate remaining tokens
-        for _ in range(max_new_tokens - 1):
-            if next_token.item() == tokenizer.eos_token_id:
-                break
-                
-            outputs = model(
-                input_ids=next_token,
-                past_key_values=past,
-                use_cache=True,
+        self.model = PeftModel.from_pretrained(self.model, lora_path, is_trainable=False)
+        self.model.eval()
+
+        # Pre-compute think tag token IDs for boundary detection
+        self._think_end_ids: list[int] = self.tokenizer.encode("</think>", add_special_tokens=False)
+
+    def interpret(
+        self,
+        context: str,
+        question: str,
+        context_type: ContextType = "question",
+        token_positions: list[int] | None = None,
+        attend_full_context: bool = False,
+        target_response: str | None = None,
+        max_new_tokens: int = 500,
+        generate_max_new_tokens: int = 2048,
+        do_sample: bool = False,
+        temperature: float = 1.0,
+    ) -> str:
+        """Run oracle inference on a single input.
+
+        Args:
+            context: The input text (question/prompt for the target model).
+            question: The oracle's question about the context.
+            context_type: Which part of context+response to attend to.
+                - "question": attend only to input question tokens (default).
+                - "cot": attend to Chain-of-Thought tokens (inside <think>...</think>).
+                - "answer": attend to final answer tokens (after </think>).
+                - "response": attend to full response (CoT + answer).
+                - "all": attend to everything (question + response).
+            token_positions: Explicit token positions to attend to (overrides context_type).
+            attend_full_context: If True AND context_type is "question" AND token_positions
+                is None, attend to ALL question tokens. Ignored for other context_types.
+            target_response: Pre-generated response text. If None and context_type needs
+                response tokens, the base model generates one live.
+            max_new_tokens: Maximum tokens for the oracle to generate.
+            generate_max_new_tokens: Maximum tokens for target model response generation.
+            do_sample: Whether to use sampling for oracle generation.
+            temperature: Temperature for sampling.
+
+        Returns:
+            Generated oracle interpretation text.
+        """
+        needs_response = context_type in ("cot", "answer", "response", "all")
+
+        # 1. Tokenize context with chat template (aligns with training convention)
+        context_messages = [{"role": "user", "content": context}]
+        context_str = self.tokenizer.apply_chat_template(
+            context_messages, tokenize=False, add_generation_prompt=needs_response,
+        )
+        context_token_ids = self.tokenizer.encode(context_str, add_special_tokens=False)
+        context_token_count = len(context_token_ids)
+
+        # 2. Build full context (possibly including target model response)
+        if needs_response:
+            if target_response is None:
+                target_response = self._generate_target_response(
+                    context, max_new_tokens=generate_max_new_tokens,
+                )
+            # Tokenize response (continues from the generation prompt, no extra special tokens)
+            response_token_ids = self.tokenizer.encode(target_response, add_special_tokens=False)
+            full_context_ids = context_token_ids + response_token_ids
+        else:
+            response_token_ids = []
+            full_context_ids = context_token_ids
+
+        # 3. Compute which positions to attend to
+        if token_positions is not None:
+            # Explicit positions override context_type
+            attend_positions = token_positions
+            use_attend_full = False
+        elif context_type == "question":
+            if attend_full_context:
+                attend_positions = list(range(context_token_count))
+                use_attend_full = True
+            else:
+                # Default: last 5 tokens of the question
+                attend_positions = list(range(max(0, context_token_count - 5), context_token_count))
+                use_attend_full = False
+        else:
+            # Compute positions from response boundaries
+            response_start = context_token_count
+            response_end = len(full_context_ids)
+            think_end = self._find_think_end(full_context_ids, response_start)
+            attend_positions = self._compute_attend_positions(
+                context_type, context_token_count, response_start, response_end, think_end,
             )
-            past = outputs.past_key_values
-            next_token_logits = outputs.logits[:, -1, :]
-            next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
-            generated_ids.append(next_token)
+            use_attend_full = False
 
-    # Decode response
-    generated_tokens = torch.cat(generated_ids, dim=-1)
-    
-    # Debug: show raw tokens
-    print(f"Generated {len(generated_ids)} tokens: {generated_tokens[0].tolist()}")
-    print(f"Raw decode: {tokenizer.decode(generated_tokens[0], skip_special_tokens=False)}")
-    
-    response = tokenizer.decode(generated_tokens[0], skip_special_tokens=True)
+        if not attend_positions:
+            logger.warning(
+                "No positions to attend to for context_type=%r. "
+                "The oracle will receive no context signal.",
+                context_type,
+            )
 
-    return response
+        # 4. Cache context KV with base model (LoRA disabled)
+        full_context_tensor = torch.tensor([full_context_ids], dtype=torch.long, device=self.device)
 
+        with torch.no_grad():
+            with self.model.disable_adapter():
+                context_outputs = self.model(
+                    input_ids=full_context_tensor,
+                    attention_mask=torch.ones_like(full_context_tensor),
+                    use_cache=True,
+                )
+                past_key_values = context_outputs.past_key_values
 
-def main():
-    # Configuration
-    MODEL_NAME = "Qwen/Qwen3-4B"
-    LORA_PATH = "nluick/kv-cached-ao-qwen3-4b"  # Set to your HF repo path, e.g., "your-username/your-lora-repo"
+        # 5. Tokenize oracle question
+        oracle_messages = [{"role": "user", "content": question}]
+        oracle_str = self.tokenizer.apply_chat_template(
+            oracle_messages, tokenize=False, add_generation_prompt=True,
+        )
+        oracle_ids = self.tokenizer.encode(oracle_str, add_special_tokens=False)
+        oracle_tensor = torch.tensor([oracle_ids], dtype=torch.long, device=self.device)
 
-    # # Example context and question
-    # CONTEXT = """The capital of France is Paris. It is known for the Eiffel Tower, 
-    # which was built in 1889. The city has a population of about 2 million people 
-    # in the city proper and over 12 million in the metropolitan area."""
+        # 6. Build attention mask
+        batch = KVCacheBatchData(
+            context_input_ids=full_context_tensor,
+            context_attention_mask=torch.ones_like(full_context_tensor, dtype=torch.bool),
+            oracle_input_ids=oracle_tensor,
+            oracle_labels=torch.full_like(oracle_tensor, -100),
+            oracle_attention_mask=torch.ones_like(oracle_tensor, dtype=torch.bool),
+            context_positions=[attend_positions],
+            context_padding_lengths=[0],
+        )
 
-    # QUESTION = "What is this text about?"
+        attention_mask = create_kv_attention_mask(
+            batch, attend_full_context=use_attend_full, device=self.device, dtype=self.dtype,
+        )
 
+        # 7. Generate oracle response with model.generate()
+        with torch.no_grad():
+            output_ids = self.model.generate(
+                input_ids=oracle_tensor,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                pad_token_id=self.tokenizer.pad_token_id,
+                max_new_tokens=max_new_tokens,
+                do_sample=do_sample,
+                temperature=temperature if do_sample else None,
+            )
 
-    CONTEXT = "Englisch ist eine schöne Sprache."
-    # QUESTION = "Answer with 'Yes' or 'No' only. Is this sentence written in English?"
-    QUESTION = "What language is this sentence written in?"
-    # Token positions to attend to (None = last 5 tokens)
-    TOKEN_POSITIONS = None  # Or specify like [10, 11, 12, 13, 14]
+        generated_tokens = output_ids[0, oracle_tensor.shape[1]:]
+        return self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
 
-    print("=" * 60)
-    print("KV Cache Inference Demo")
-    print("=" * 60)
+    def _generate_target_response(self, context: str, max_new_tokens: int = 2048) -> str:
+        """Generate a response from the base model (LoRA disabled) for the given context."""
+        messages = [{"role": "user", "content": context}]
+        input_str = self.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True,
+        )
+        input_ids = self.tokenizer.encode(input_str, add_special_tokens=False)
+        input_tensor = torch.tensor([input_ids], dtype=torch.long, device=self.device)
 
-    # Load model
-    print(f"\nLoading model: {MODEL_NAME}")
-    if LORA_PATH:
-        print(f"With LoRA: {LORA_PATH}")
-    else:
-        print("Without LoRA (base model only)")
+        with torch.no_grad():
+            with self.model.disable_adapter():
+                output_ids = self.model.generate(
+                    input_ids=input_tensor,
+                    attention_mask=torch.ones_like(input_tensor),
+                    max_new_tokens=max_new_tokens,
+                    do_sample=False,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                )
 
-    model, tokenizer = load_model_with_lora(MODEL_NAME, LORA_PATH)
+        generated = output_ids[0, input_tensor.shape[1]:]
+        # Keep special tokens so we can detect <think>...</think> boundaries
+        return self.tokenizer.decode(generated, skip_special_tokens=False)
 
-    # Check if model is a PeftModel (required for disable_adapter)
-    if not isinstance(model, PeftModel):
-        print("\nError: LoRA adapter required for KV cache mode.")
-        print("The disable_adapter() context manager requires a PeftModel.")
-        return
+    def _find_think_end(self, full_token_ids: list[int], response_start: int) -> int | None:
+        """Find the position right after </think> in the response portion.
 
-    print(f"\nContext:\n{CONTEXT}\n")
-    print(f"Question: {QUESTION}\n")
+        Returns:
+            Absolute index in full_token_ids right after the </think> tag,
+            or None if no </think> tag is found.
+        """
+        tag = self._think_end_ids
+        tag_len = len(tag)
+        response_tokens = full_token_ids[response_start:]
 
-    # Run interpretation with KV cache architecture (same as training)
-    # Set attend_full_context=True to attend to all context tokens for testing
-    response = interpret_tokens(
-        model=model,
-        tokenizer=tokenizer,
-        context=CONTEXT,
-        question=QUESTION,
-        token_positions=TOKEN_POSITIONS,
-        attend_full_context=True,  # Set to False + specific token_positions for selective attention
-    )
+        for i in range(len(response_tokens) - tag_len + 1):
+            if response_tokens[i : i + tag_len] == tag:
+                return response_start + i + tag_len
 
-    print(f"Response:\n{response}")
-    print("=" * 60)
+        return None
+
+    def _compute_attend_positions(
+        self,
+        context_type: ContextType,
+        context_token_count: int,
+        response_start: int,
+        response_end: int,
+        think_end: int | None,
+    ) -> list[int]:
+        """Compute which token positions to attend to based on context_type."""
+        if context_type == "question":
+            return list(range(context_token_count))
+
+        if context_type == "cot":
+            if think_end is None:
+                logger.warning("No <think>...</think> tags found. context_type='cot' returns empty positions.")
+                return []
+            return list(range(response_start, think_end))
+
+        if context_type == "answer":
+            if think_end is None:
+                # No thinking tags: entire response is the "answer"
+                return list(range(response_start, response_end))
+            return list(range(think_end, response_end))
+
+        if context_type == "response":
+            return list(range(response_start, response_end))
+
+        if context_type == "all":
+            return list(range(response_end))
+
+        raise ValueError(f"Unknown context_type: {context_type!r}")
 
 
 if __name__ == "__main__":
-    main()
+    oracle = KVCacheOracle(
+        model_name="Qwen/Qwen3-4B",
+        lora_path="nluick/kv-cached-ao-qwen3-4b",
+    )
+
+    # Example 1: Attend to all question tokens (current behavior)
+    print("=" * 60)
+    print("Example 1: question-only, attend_full_context=True")
+    result = oracle.interpret(
+        context="Englisch ist eine schöne Sprache.",
+        question="What language is this sentence written in?",
+        context_type="question",
+        attend_full_context=True,
+    )
+    print(f"Response: {result}")
+
+    # Example 2: Attend to target model's CoT (live generation)
+    print("=" * 60)
+    print("Example 2: attend to model's CoT")
+    result = oracle.interpret(
+        context="What is 2+2?",
+        question="Is the model's reasoning correct? Answer Yes or No.",
+        context_type="cot",
+    )
+    print(f"Response: {result}")
+
+    # Example 3: Attend to pre-generated answer
+    print("=" * 60)
+    print("Example 3: attend to pre-generated answer")
+    result = oracle.interpret(
+        context="What is the capital of France?",
+        question="Is this answer correct? Answer Yes or No.",
+        context_type="answer",
+        target_response="<think>Let me think... France is a country in Europe.</think>The capital is Paris.",
+    )
+    print(f"Response: {result}")
+
+    # Example 4: Attend to full response (CoT + answer)
+    print("=" * 60)
+    print("Example 4: attend to full response")
+    result = oracle.interpret(
+        context="Translate 'hello' to French.",
+        question="What task was the model performing?",
+        context_type="response",
+    )
+    print(f"Response: {result}")

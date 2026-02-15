@@ -230,16 +230,16 @@ def create_kv_attention_mask(
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     """Create 4D attention mask for KV cache mode.
-    
+
     Returns mask of shape [B, 1, O, C + O] where:
     - B = batch size
     - O = oracle sequence length (after padding)
     - C = context sequence length (after padding)
-    
+
     The mask is in the format expected by HuggingFace models:
     - 0.0 = attend
     - -inf (large negative) = don't attend
-    
+
     For each oracle token at position i:
     - Can attend to selected context positions (or all if attend_full_context=True)
     - Can attend to oracle positions 0..i (causal within oracle)
@@ -247,41 +247,37 @@ def create_kv_attention_mask(
     B = batch.oracle_input_ids.shape[0]
     O = batch.oracle_input_ids.shape[1]
     C = batch.context_input_ids.shape[1]
-    
+
     if device is None:
         device = batch.oracle_input_ids.device
 
-    # Initialize with all masked (-inf)
-    # Shape: [B, 1, O, C + O]
-    mask = torch.full((B, 1, O, C + O), float('-inf'), device=device, dtype=dtype)
+    _zero = torch.tensor(0.0, dtype=dtype, device=device)
+    _neginf = torch.tensor(float("-inf"), dtype=dtype, device=device)
 
-    for b in range(B):
-        # Get padding info
-        ctx_pad_len = batch.context_padding_lengths[b]
-        oracle_pad_len = (batch.oracle_attention_mask[b] == False).sum().item()
-        
-        # Context attention: only to selected positions (adjusted for padding)
-        if attend_full_context:
-            # Attend to all non-padding context positions
-            ctx_start = ctx_pad_len
-            ctx_end = C
-            mask[b, 0, :, ctx_start:ctx_end] = 0.0
-        else:
-            # Attend only to selected context positions
-            for pos in batch.context_positions[b]:
-                adjusted_pos = pos + ctx_pad_len
-                if 0 <= adjusted_pos < C:
-                    mask[b, 0, :, adjusted_pos] = 0.0
+    # --- Region 1: Context attention [B, 1, 1, C] (broadcasts over O) ---
+    if attend_full_context:
+        # Attend to all non-padding context positions
+        ctx_attend = batch.context_attention_mask  # [B, C] bool
+    else:
+        # Attend only to selected context positions (adjusted for padding)
+        ctx_attend = torch.zeros(B, C, dtype=torch.bool, device=device)
+        for b in range(B):
+            adjusted = [p + batch.context_padding_lengths[b] for p in batch.context_positions[b]]
+            if adjusted:
+                ctx_attend[b, adjusted] = True
 
-        # Oracle self-attention: causal mask within oracle tokens
-        # Each oracle token i can attend to oracle tokens 0..i
-        # Oracle tokens start at position C in the combined sequence
-        for i in range(O):
-            # Only unmask if this oracle position is not padding
-            if i >= oracle_pad_len:
-                # Can attend to all previous non-padding oracle tokens (causal)
-                for j in range(oracle_pad_len, i + 1):
-                    mask[b, 0, i, C + j] = 0.0
+    context_region = torch.where(ctx_attend[:, None, None, :], _zero, _neginf)  # [B, 1, 1, C]
+
+    # --- Region 2: Oracle causal self-attention [B, 1, O, O] ---
+    oracle_range = torch.arange(O, device=device)
+    causal = oracle_range.unsqueeze(0) <= oracle_range.unsqueeze(1)  # [O, O] lower-triangular
+    oracle_real = batch.oracle_attention_mask  # [B, O] bool
+    # Position i can attend to position j if: j<=i (causal), i is real, j is real
+    oracle_valid = causal[None, :, :] & oracle_real[:, None, :] & oracle_real[:, :, None]  # [B, O, O]
+    oracle_region = torch.where(oracle_valid[:, None, :, :], _zero, _neginf)  # [B, 1, O, O]
+
+    # --- Combine: [B, 1, O, C + O] ---
+    mask = torch.cat([context_region.expand(B, 1, O, C), oracle_region], dim=-1)
 
     return mask
 
