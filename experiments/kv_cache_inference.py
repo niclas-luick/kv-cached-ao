@@ -188,20 +188,50 @@ class KVCacheOracle:
             batch, attend_full_context=use_attend_full, device=self.device, dtype=self.dtype,
         )
 
-        # 7. Generate oracle response with model.generate()
+        # 7. Generate oracle response
+        # model.generate() rejects 4D attention masks in transformers 4.55+,
+        # so we use a manual prefill + decode loop.
         with torch.no_grad():
-            output_ids = self.model.generate(
+            # Prefill: process the full oracle prompt with the 4D KV-cache mask
+            outputs = self.model(
                 input_ids=oracle_tensor,
                 attention_mask=attention_mask,
                 past_key_values=past_key_values,
-                pad_token_id=self.tokenizer.pad_token_id,
-                max_new_tokens=max_new_tokens,
-                do_sample=do_sample,
-                temperature=temperature if do_sample else None,
+                use_cache=True,
             )
+            past = outputs.past_key_values
+            next_logits = outputs.logits[:, -1, :]
 
-        generated_tokens = output_ids[0, oracle_tensor.shape[1]:]
-        return self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
+            if do_sample and temperature > 0:
+                probs = torch.softmax(next_logits / temperature, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+            else:
+                next_token = next_logits.argmax(dim=-1, keepdim=True)
+
+            generated = [next_token]
+
+            # Decode loop: generate one token at a time
+            for _ in range(max_new_tokens - 1):
+                if next_token.item() == self.tokenizer.eos_token_id:
+                    break
+                outputs = self.model(
+                    input_ids=next_token,
+                    past_key_values=past,
+                    use_cache=True,
+                )
+                past = outputs.past_key_values
+                next_logits = outputs.logits[:, -1, :]
+
+                if do_sample and temperature > 0:
+                    probs = torch.softmax(next_logits / temperature, dim=-1)
+                    next_token = torch.multinomial(probs, num_samples=1)
+                else:
+                    next_token = next_logits.argmax(dim=-1, keepdim=True)
+
+                generated.append(next_token)
+
+        generated_tokens = torch.cat(generated, dim=-1)
+        return self.tokenizer.decode(generated_tokens[0], skip_special_tokens=True)
 
     def _generate_target_response(self, context: str, max_new_tokens: int = 2048) -> str:
         """Generate a response from the base model (LoRA disabled) for the given context."""
