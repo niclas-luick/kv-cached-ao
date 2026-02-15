@@ -82,6 +82,7 @@ class KVCacheOracle:
         generate_max_new_tokens: int = 2048,
         do_sample: bool = False,
         temperature: float = 1.0,
+        suppress_stop_for: int = 0,
         verbose: bool = False,
     ) -> str:
         """Run oracle inference on a single input.
@@ -104,6 +105,9 @@ class KVCacheOracle:
             generate_max_new_tokens: Maximum tokens for target model response generation.
             do_sample: Whether to use sampling for oracle generation.
             temperature: Temperature for sampling.
+            suppress_stop_for: Number of initial tokens during which stop/special tokens
+                are suppressed (logits set to -inf). Useful when the oracle immediately
+                emits a stop token for unfamiliar context types.
             verbose: If True, print diagnostic info (token counts, attend positions,
                 first generated token) to help debug empty or unexpected responses.
 
@@ -226,6 +230,18 @@ class KVCacheOracle:
         # 7. Generate oracle response
         # model.generate() rejects 4D attention masks in transformers 4.55+,
         # so we use a manual prefill + decode loop.
+        suppress_ids = list(self._stop_ids) if suppress_stop_for > 0 else []
+
+        def _sample(logits: torch.Tensor, step: int) -> torch.Tensor:
+            """Pick next token from logits, optionally suppressing stop tokens."""
+            if step < suppress_stop_for and suppress_ids:
+                logits = logits.clone()
+                logits[:, suppress_ids] = float("-inf")
+            if do_sample and temperature > 0:
+                probs = torch.softmax(logits / temperature, dim=-1)
+                return torch.multinomial(probs, num_samples=1)
+            return logits.argmax(dim=-1, keepdim=True)
+
         with torch.no_grad():
             # Prefill: process the full oracle prompt with the 4D KV-cache mask
             outputs = self.model(
@@ -235,14 +251,7 @@ class KVCacheOracle:
                 use_cache=True,
             )
             past = outputs.past_key_values
-            next_logits = outputs.logits[:, -1, :]
-
-            if do_sample and temperature > 0:
-                probs = torch.softmax(next_logits / temperature, dim=-1)
-                next_token = torch.multinomial(probs, num_samples=1)
-            else:
-                next_token = next_logits.argmax(dim=-1, keepdim=True)
-
+            next_token = _sample(outputs.logits[:, -1, :], step=0)
             generated = [next_token]
 
             if verbose:
@@ -250,14 +259,12 @@ class KVCacheOracle:
                 first_str = self.tokenizer.decode([first_id], skip_special_tokens=False)
                 is_stop = first_id in self._stop_ids
                 print(f"  [diag] first generated token: id={first_id}, text={first_str!r}, is_stop={is_stop}")
-                if is_stop:
-                    print(f"  [diag] WARNING: first token is a stop token — oracle produced empty output.")
-                    print(f"  [diag] This likely means the model is out-of-distribution for context_type={context_type!r}.")
-                    print(f"  [diag] The LoRA adapter may need fine-tuning on {context_type}-type contexts.")
+                if is_stop and suppress_stop_for == 0:
+                    print(f"  [diag] TIP: try suppress_stop_for=1 (or higher) to force past initial stop tokens.")
 
             # Decode loop: generate one token at a time
-            for _ in range(max_new_tokens - 1):
-                if next_token.item() in self._stop_ids:
+            for step in range(1, max_new_tokens):
+                if next_token.item() in self._stop_ids and step >= suppress_stop_for:
                     break
                 outputs = self.model(
                     input_ids=next_token,
@@ -265,14 +272,7 @@ class KVCacheOracle:
                     use_cache=True,
                 )
                 past = outputs.past_key_values
-                next_logits = outputs.logits[:, -1, :]
-
-                if do_sample and temperature > 0:
-                    probs = torch.softmax(next_logits / temperature, dim=-1)
-                    next_token = torch.multinomial(probs, num_samples=1)
-                else:
-                    next_token = next_logits.argmax(dim=-1, keepdim=True)
-
+                next_token = _sample(outputs.logits[:, -1, :], step=step)
                 generated.append(next_token)
 
         generated_tokens = torch.cat(generated, dim=-1)
@@ -386,6 +386,7 @@ if __name__ == "__main__":
         context="What is 2+2?",
         question="Is the model's reasoning correct? Answer Yes or No.",
         context_type="cot",
+        suppress_stop_for=1,
         verbose=True,
     )
     print(f"Response: {result}")
@@ -398,6 +399,7 @@ if __name__ == "__main__":
         question="Is this answer correct? Answer Yes or No.",
         context_type="answer",
         target_response="<think>Let me think... France is a country in Europe.</think>The capital is Paris.",
+        suppress_stop_for=1,
         verbose=True,
     )
     print(f"Response: {result}")
@@ -409,6 +411,7 @@ if __name__ == "__main__":
         context="Translate 'hello' to French.",
         question="What task was the model performing?",
         context_type="response",
+        suppress_stop_for=1,
         verbose=True,
     )
     print(f"Response: {result}")
