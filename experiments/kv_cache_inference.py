@@ -82,6 +82,7 @@ class KVCacheOracle:
         generate_max_new_tokens: int = 2048,
         do_sample: bool = False,
         temperature: float = 1.0,
+        verbose: bool = False,
     ) -> str:
         """Run oracle inference on a single input.
 
@@ -103,6 +104,8 @@ class KVCacheOracle:
             generate_max_new_tokens: Maximum tokens for target model response generation.
             do_sample: Whether to use sampling for oracle generation.
             temperature: Temperature for sampling.
+            verbose: If True, print diagnostic info (token counts, attend positions,
+                first generated token) to help debug empty or unexpected responses.
 
         Returns:
             Generated oracle interpretation text.
@@ -135,6 +138,13 @@ class KVCacheOracle:
             response_token_ids = []
             full_context_ids = context_token_ids
 
+        if verbose:
+            print(f"  [diag] context_type={context_type!r}")
+            print(f"  [diag] context_tokens={context_token_count}, response_tokens={len(response_token_ids)}, total={len(full_context_ids)}")
+            if response_token_ids:
+                decoded_resp = self.tokenizer.decode(response_token_ids, skip_special_tokens=False)
+                print(f"  [diag] response preview: {decoded_resp[:200]}{'...' if len(decoded_resp) > 200 else ''}")
+
         # 3. Compute which positions to attend to
         if token_positions is not None:
             # Explicit positions override context_type
@@ -157,6 +167,19 @@ class KVCacheOracle:
                 context_type, context_token_count, response_start, response_end, think_end,
             )
             use_attend_full = False
+
+        if verbose:
+            print(f"  [diag] attend_positions count={len(attend_positions)}", end="")
+            if attend_positions:
+                print(f", range=[{min(attend_positions)}..{max(attend_positions)}]", end="")
+                # Show what tokens are being attended to
+                attended_text = self.tokenizer.decode(
+                    [full_context_ids[p] for p in attend_positions if p < len(full_context_ids)],
+                    skip_special_tokens=False,
+                )
+                print(f"\n  [diag] attended text: {attended_text[:200]}{'...' if len(attended_text) > 200 else ''}")
+            else:
+                print()
 
         if not attend_positions:
             logger.warning(
@@ -221,6 +244,16 @@ class KVCacheOracle:
                 next_token = next_logits.argmax(dim=-1, keepdim=True)
 
             generated = [next_token]
+
+            if verbose:
+                first_id = next_token.item()
+                first_str = self.tokenizer.decode([first_id], skip_special_tokens=False)
+                is_stop = first_id in self._stop_ids
+                print(f"  [diag] first generated token: id={first_id}, text={first_str!r}, is_stop={is_stop}")
+                if is_stop:
+                    print(f"  [diag] WARNING: first token is a stop token — oracle produced empty output.")
+                    print(f"  [diag] This likely means the model is out-of-distribution for context_type={context_type!r}.")
+                    print(f"  [diag] The LoRA adapter may need fine-tuning on {context_type}-type contexts.")
 
             # Decode loop: generate one token at a time
             for _ in range(max_new_tokens - 1):
@@ -342,6 +375,7 @@ if __name__ == "__main__":
         question="What language is this sentence written in?",
         context_type="question",
         attend_full_context=True,
+        verbose=True,
     )
     print(f"Response: {result}")
 
@@ -352,6 +386,7 @@ if __name__ == "__main__":
         context="What is 2+2?",
         question="Is the model's reasoning correct? Answer Yes or No.",
         context_type="cot",
+        verbose=True,
     )
     print(f"Response: {result}")
 
@@ -363,6 +398,7 @@ if __name__ == "__main__":
         question="Is this answer correct? Answer Yes or No.",
         context_type="answer",
         target_response="<think>Let me think... France is a country in Europe.</think>The capital is Paris.",
+        verbose=True,
     )
     print(f"Response: {result}")
 
@@ -373,5 +409,6 @@ if __name__ == "__main__":
         context="Translate 'hello' to French.",
         question="What task was the model performing?",
         context_type="response",
+        verbose=True,
     )
     print(f"Response: {result}")
