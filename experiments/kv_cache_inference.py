@@ -227,29 +227,7 @@ class KVCacheOracle:
             batch, attend_full_context=use_attend_full, device=self.device, dtype=self.dtype,
         )
 
-        # 7. Compute oracle position IDs to match training RoPE distances.
-        # During training, the oracle follows immediately after a short context (~15 tokens).
-        # For response-type contexts, the KV cache is much longer (~200-400 tokens), pushing
-        # the oracle far away in position space. We fix this by placing the oracle right after
-        # the last attended position, so relative distances match training.
-        if attend_positions:
-            oracle_start_pos = max(attend_positions) + 1
-        else:
-            oracle_start_pos = len(full_context_ids)
-
-        oracle_seq_len = oracle_tensor.shape[1]
-        oracle_position_ids = torch.arange(
-            oracle_start_pos, oracle_start_pos + oracle_seq_len, device=self.device,
-        ).unsqueeze(0)
-
-        if verbose:
-            default_start = len(full_context_ids)
-            print(
-                f"  [diag] oracle position_ids start={oracle_start_pos} "
-                f"(default would be {default_start}, delta={default_start - oracle_start_pos})"
-            )
-
-        # 8. Generate oracle response
+        # 7. Generate oracle response
         # model.generate() rejects 4D attention masks in transformers 4.55+,
         # so we use a manual prefill + decode loop.
         suppress_ids = list(self._stop_ids) if suppress_stop_for > 0 else []
@@ -270,7 +248,6 @@ class KVCacheOracle:
                 input_ids=oracle_tensor,
                 attention_mask=attention_mask,
                 past_key_values=past_key_values,
-                position_ids=oracle_position_ids,
                 use_cache=True,
             )
             past = outputs.past_key_values
@@ -286,17 +263,14 @@ class KVCacheOracle:
                     print(f"  [diag] TIP: try suppress_stop_for=1 (or higher) to force past initial stop tokens.")
 
             # Decode loop: generate one token at a time
-            decode_pos = oracle_start_pos + oracle_seq_len
             for step in range(1, max_new_tokens):
                 if next_token.item() in self._stop_ids and step >= suppress_stop_for:
                     break
                 outputs = self.model(
                     input_ids=next_token,
                     past_key_values=past,
-                    position_ids=torch.tensor([[decode_pos]], device=self.device),
                     use_cache=True,
                 )
-                decode_pos += 1
                 past = outputs.past_key_values
                 next_token = _sample(outputs.logits[:, -1, :], step=step)
                 generated.append(next_token)
