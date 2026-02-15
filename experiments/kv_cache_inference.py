@@ -63,6 +63,13 @@ class KVCacheOracle:
         # Pre-compute think tag token IDs for boundary detection
         self._think_end_ids: list[int] = self.tokenizer.encode("</think>", add_special_tokens=False)
 
+        # Collect all stop token IDs for generation (EOS + any model-specific end tokens)
+        self._stop_ids: set[int] = {self.tokenizer.eos_token_id}
+        if hasattr(self.tokenizer, "added_tokens_encoder"):
+            for tok_str, tok_id in self.tokenizer.added_tokens_encoder.items():
+                if "end" in tok_str.lower() or tok_str in ("<|im_end|>", "<|eot_id|>"):
+                    self._stop_ids.add(tok_id)
+
     def interpret(
         self,
         context: str,
@@ -113,11 +120,16 @@ class KVCacheOracle:
         # 2. Build full context (possibly including target model response)
         if needs_response:
             if target_response is None:
-                target_response = self._generate_target_response(
+                # Live generation: returns raw token IDs (already stripped of trailing stop tokens)
+                response_token_ids = self._generate_target_response(
                     context, max_new_tokens=generate_max_new_tokens,
                 )
-            # Tokenize response (continues from the generation prompt, no extra special tokens)
-            response_token_ids = self.tokenizer.encode(target_response, add_special_tokens=False)
+            else:
+                # Pre-generated string: encode and strip trailing stop tokens
+                response_token_ids = self.tokenizer.encode(target_response, add_special_tokens=False)
+                special_ids = self.tokenizer.all_special_ids
+                while response_token_ids and response_token_ids[-1] in special_ids:
+                    response_token_ids.pop()
             full_context_ids = context_token_ids + response_token_ids
         else:
             response_token_ids = []
@@ -212,7 +224,7 @@ class KVCacheOracle:
 
             # Decode loop: generate one token at a time
             for _ in range(max_new_tokens - 1):
-                if next_token.item() == self.tokenizer.eos_token_id:
+                if next_token.item() in self._stop_ids:
                     break
                 outputs = self.model(
                     input_ids=next_token,
@@ -233,8 +245,12 @@ class KVCacheOracle:
         generated_tokens = torch.cat(generated, dim=-1)
         return self.tokenizer.decode(generated_tokens[0], skip_special_tokens=True)
 
-    def _generate_target_response(self, context: str, max_new_tokens: int = 2048) -> str:
-        """Generate a response from the base model (LoRA disabled) for the given context."""
+    def _generate_target_response(self, context: str, max_new_tokens: int = 2048) -> list[int]:
+        """Generate response token IDs from the base model (LoRA disabled).
+
+        Returns raw token IDs with trailing stop tokens stripped, preserving
+        internal special tokens like <think>/<​/think> for boundary detection.
+        """
         messages = [{"role": "user", "content": context}]
         input_str = self.tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True,
@@ -252,9 +268,15 @@ class KVCacheOracle:
                     pad_token_id=self.tokenizer.pad_token_id,
                 )
 
-        generated = output_ids[0, input_tensor.shape[1]:]
-        # Keep special tokens so we can detect <think>...</think> boundaries
-        return self.tokenizer.decode(generated, skip_special_tokens=False)
+        generated: list[int] = output_ids[0, input_tensor.shape[1]:].tolist()
+
+        # Strip trailing stop/special tokens (EOS, <|im_end|>, etc.)
+        # but keep internal ones like <think>/<​/think>
+        special_ids = self.tokenizer.all_special_ids
+        while generated and generated[-1] in special_ids:
+            generated.pop()
+
+        return generated
 
     def _find_think_end(self, full_token_ids: list[int], response_start: int) -> int | None:
         """Find the position right after </think> in the response portion.
